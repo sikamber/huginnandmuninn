@@ -1,0 +1,59 @@
+from datetime import datetime
+from uuid import uuid4
+
+from sqlmodel import Field, Session, SQLModel, col, select
+
+from database import engine
+
+
+class InboxItem(SQLModel, table=True):
+    id: str = Field(default_factory=lambda: str(uuid4()), primary_key=True)
+    content: str
+    status: str = "unprocessed"
+    energy: str | None = None
+    created_at: datetime = Field(default_factory=datetime.now)
+
+
+class InboxStore:
+    def create(self, content: str) -> InboxItem:
+        item = InboxItem(content=content)
+        with Session(engine) as session:
+            session.add(item)
+            session.commit()
+            session.refresh(item)
+        return item
+
+    def list_unprocessed(self) -> list[InboxItem]:
+        with Session(engine) as session:
+            return list(session.exec(select(InboxItem).where(col(InboxItem.status) == "unprocessed").order_by(col(InboxItem.created_at))).all())
+
+    def get_next(self, max_energy: str | None = None) -> InboxItem | None:
+        energy_order = {"low": 0, "medium": 1, "high": 2}
+        with Session(engine) as session:
+            statement = select(InboxItem).where(col(InboxItem.status) == "unprocessed")
+            if max_energy:
+                max_level = energy_order.get(max_energy, 2)
+                allowed = [e for e, level in energy_order.items() if level <= max_level]
+                statement = statement.where(
+                    (col(InboxItem.energy) == None) | col(InboxItem.energy).in_(allowed)
+                )
+            statement = statement.order_by(col(InboxItem.created_at))
+            return session.exec(statement).first()
+
+    VALID_STATUSES = {"unprocessed", "processed", "discarded"}
+
+    def update(self, item_id: str, status: str | None = None, energy: str | None = None) -> InboxItem | None:
+        with Session(engine) as session:
+            item = session.get(InboxItem, item_id)
+            if not item:
+                return None
+            if status is not None:
+                if status not in self.VALID_STATUSES:
+                    raise ValueError(f"Invalid inbox status '{status}'. Must be one of: {self.VALID_STATUSES}")
+                item.status = status
+            if energy is not None:
+                item.energy = energy
+            session.add(item)
+            session.commit()
+            session.refresh(item)
+            return item
