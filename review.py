@@ -137,7 +137,7 @@ def get_next_review_item(today: date | None = None) -> dict | None:
     candidates.sort(key=lambda x: -x[0])
     days_overdue, item_type, item = candidates[0]
 
-    return {
+    result = {
         "type": item_type,
         "id": item.id,
         "title": item.title,
@@ -147,6 +147,19 @@ def get_next_review_item(today: date | None = None) -> dict | None:
         "last_reviewed": str(item.last_reviewed) if item.last_reviewed else "never",
         "days_overdue": days_overdue,
     }
+
+    if item_type == "quest":
+        result["tasks"] = [
+            {"id": t.id, "title": t.title, "status": t.status, "description": t.description}
+            for t in tasks if t.quest_id == item.id
+        ]
+    elif item_type == "quest_line":
+        result["quests"] = [
+            {"id": q.id, "title": q.title, "status": q.status, "description": q.description}
+            for q in quests if q.quest_line_id == item.id
+        ]
+
+    return result
 
 
 def get_no_oversight_items(today: date | None = None) -> list[dict]:
