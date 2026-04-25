@@ -9,6 +9,8 @@ export default defineConfig({
       "/chat": "http://localhost:8000",
       "/inbox": "http://localhost:8000",
       "/initial": "http://localhost:8000",
+      "/dashboard": "http://localhost:8000",
+      "/tasks": "http://localhost:8000",
     },
   },
 })

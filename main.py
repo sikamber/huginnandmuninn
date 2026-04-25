@@ -1,13 +1,15 @@
 from contextlib import asynccontextmanager
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 import json
 import logging
+import os
 from zoneinfo import ZoneInfo
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("huginn")
 
 from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from pydantic_ai import Agent, RunContext
 from pydantic_ai.messages import ModelMessagesTypeAdapter, ModelRequest, ModelResponse, TextPart, UserPromptPart
@@ -21,10 +23,9 @@ CACHE_SETTINGS = AnthropicModelSettings(
 from cache import response_cache
 from database import create_tables
 from deps import AppDeps
-from inbox import InboxItem, InboxStore
+from inbox import InboxStore
 from quests import Quest, QuestLine, QuestLineStore, QuestStore
-from radar import get_radar
-from review import get_empty_structure_items, get_no_oversight_items, get_next_review_item
+from review import build_review_summary, get_next_review_item
 from subjects import Subject, SubjectStore
 from tasks import Task, TaskStore
 
@@ -45,8 +46,6 @@ deps = AppDeps(
 )
 agent = Agent("anthropic:claude-sonnet-4-6", deps_type=AppDeps)
 
-RADAR_CLEAR = "Your radar is clear — nothing is overdue, flagged, or due for review right now."
-REVIEW_CLEAR = "Nothing to review right now — no overdue reviews, unprocessed inbox items, or open subjects."
 
 ENERGY_ORDER = {"low": 0, "medium": 1, "high": 2}
 
@@ -55,165 +54,65 @@ def _within_energy(item_energy: str | None, max_energy: str | None) -> bool:
         return True
     return ENERGY_ORDER.get(item_energy, 0) <= ENERGY_ORDER.get(max_energy, 2)
 
-def _empty_message(mode: str, hidden: int, energy_level: str | None) -> str:
-    suffix = f" ({hidden} item(s) hidden above your current energy level.)" if hidden and energy_level else ""
-    if mode == "radar":
-        return RADAR_CLEAR
-    if mode == "review":
-        return REVIEW_CLEAR + suffix
-    if mode == "quests":
-        base = "No quests match your current energy level." if hidden and energy_level else "No quests yet."
-        return base + suffix
-    return ""
 
+def build_quest_data(quest_line_store, quest_store, task_store, energy_level: str | None = None) -> dict:
+    today = date.today()
+    all_qls = quest_line_store.list()
+    all_quests = quest_store.list()
+    all_tasks = task_store.list()
 
-def build_initial_prompt(mode: str, energy_level: str | None = None) -> tuple[str | None, int]:
-    """Returns (prompt_for_ai_or_None, hidden_item_count)."""
-    if mode == "radar":
-        data = get_radar()
-        def _any_items(v) -> bool:
-            if isinstance(v, list): return bool(v)
-            if isinstance(v, dict): return any(_any_items(x) for x in v.values())
-            return bool(v)
-        if not any(_any_items(v) for v in data.values()):
-            return None, 0
-        return (
-            "Here is the current radar data. Interpret it and give a concise summary of what needs attention.\n\n"
-            f"{json.dumps(data, indent=2)}"
-        ), 0
+    tracked_qls = [ql for ql in all_qls if ql.status == "tracked" and _within_energy(ql.energy, energy_level)]
+    tracked_quests = [q for q in all_quests if q.status == "tracked" and _within_energy(q.energy, energy_level)]
+    tracked_ql_ids = {ql.id for ql in tracked_qls}
 
-    if mode == "review":
-        item = get_next_review_item()
-        all_inbox = deps.inbox.list_unprocessed()
-        inbox_items = [i for i in all_inbox if _within_energy(i.energy, energy_level)]
-        hidden = len(all_inbox) - len(inbox_items)
-        open_subjects = deps.subjects.list(state="open")
+    hidden = sum(1 for i in all_qls + all_quests if not _within_energy(i.energy, energy_level))
+    deferred = sum(1 for i in all_qls + all_quests if i.defer_until and i.defer_until > today)
 
-        parts = []
-        if item:
-            parts.append("Next item due for review — present it and ask what the user would like to do:\n\n" + json.dumps(item, indent=2))
-        if inbox_items:
-            first = inbox_items[0]
-            first_data = {"kind": "inbox", "id": first.id, "content": first.content, "energy": first.energy, "created_at": str(first.created_at.date())}
-            count = len(inbox_items)
-            header = f"There are {count} unprocessed inbox item(s). Present the first one, then use get_next_item after each is handled to advance:\n\n"
-            parts.append(header + json.dumps(first_data, indent=2))
-        if open_subjects:
-            subjects_data = [{"id": s.id, "title": s.title, "summary": s.summary, "last_discussed": str(s.last_discussed.date())} for s in open_subjects]
-            parts.append("Open subjects (ongoing memory — flag any that seem stale or worth revisiting):\n\n" + json.dumps(subjects_data, indent=2))
-        no_oversight = get_no_oversight_items()
-        if no_oversight:
-            parts.append("Items with no oversight (no parent and no review interval — suggest adding one):\n\n" + json.dumps(no_oversight, indent=2))
-        empty_structure = get_empty_structure_items()
-        if empty_structure["quests_no_tasks"] or empty_structure["quest_lines_no_quests"]:
-            parts.append("Structural gaps (quests with no tasks / quest lines with no quests — worth reviewing):\n\n" + json.dumps(empty_structure, indent=2))
-        if hidden:
-            parts.append(f"Note: {hidden} inbox item(s) are hidden because they exceed the user's current energy level ({energy_level}).")
-
-        return ("\n\n".join(parts) if parts else None), hidden
-
-    if mode == "quests":
-        all_qls = deps.quest_lines.list()
-        all_quests = deps.quests.list()
-
-        def _pick_tier(items, *statuses):
-            for status in statuses:
-                tier = [i for i in items if i.status == status and _within_energy(i.energy, energy_level)]
-                if tier:
-                    return tier, status
-            return [], None
-
-        quest_lines, ql_tier = _pick_tier(all_qls, "tracked", "current", "available")
-        quests, q_tier = _pick_tier(all_quests, "tracked", "current", "available")
-        active_tier = ql_tier or q_tier
-
-        today = date.today()
-        all_energy_filtered = [i for i in all_qls + all_quests if not _within_energy(i.energy, energy_level)]
-        all_deferred = [i for i in all_qls + all_quests if i.defer_until and i.defer_until > today]
-        hidden = len(all_energy_filtered)
-        deferred_count = len(all_deferred)
-
-        if not quest_lines and not quests:
-            return None, hidden
-
-        shown_quest_ids = {q.id for q in quests}
-        all_tasks = deps.tasks.list()
-        relevant_tasks = [
-            t for t in all_tasks
-            if (t.quest_id in shown_quest_ids or t.quest_id is None)
-            and t.status != "done"
-            and _within_energy(t.energy, energy_level)
-            and not (t.defer_until and t.defer_until > today)
-        ]
-
-        # --- Quest page flags ---
-        task_count_by_quest = {}
-        for t in all_tasks:
+    tasks_by_quest: dict[str, list] = {}
+    questless_tasks = []
+    for t in all_tasks:
+        if t.status != "done" and _within_energy(t.energy, energy_level) and not (t.defer_until and t.defer_until > today):
             if t.quest_id:
-                task_count_by_quest[t.quest_id] = task_count_by_quest.get(t.quest_id, 0) + 1
+                tasks_by_quest.setdefault(t.quest_id, []).append(t)
+            else:
+                questless_tasks.append(t)
 
-        flags: dict[str, list] = {}
-
-        # Hard deadlines on shown items
-        hard_overdue, hard_upcoming, soft_upcoming = [], [], []
-        for item_type, item in (
-            [("task", t) for t in relevant_tasks]
-            + [("quest", q) for q in quests]
-            + [("quest_line", ql) for ql in quest_lines]
-        ):
-            if not item.due_date:
-                continue
-            entry = {"type": item_type, "id": item.id, "title": item.title, "due_date": str(item.due_date), "note": item.deadline_note}
-            if item.deadline_type == "hard":
-                if item.due_date < today:
-                    hard_overdue.append(entry)
-                elif item.due_date <= today + timedelta(days=7):
-                    hard_upcoming.append(entry)
-            elif item.deadline_type == "soft" and item.due_date <= today + timedelta(days=14):
-                soft_upcoming.append(entry)
-        if hard_overdue:
-            flags["hard_overdue"] = hard_overdue
-        if hard_upcoming:
-            flags["hard_upcoming"] = hard_upcoming
-        if soft_upcoming:
-            flags["soft_upcoming"] = soft_upcoming
-
-        # Tracked/current quests with no tasks
-        no_tasks = [
-            {"id": q.id, "title": q.title, "status": q.status}
-            for q in quests if q.status in ("tracked", "current") and task_count_by_quest.get(q.id, 0) == 0
-        ]
-        if no_tasks:
-            flags["no_tasks"] = no_tasks
-
-        # Newly available (deferred items that just unblocked)
-        all_shown = [(t, "task") for t in all_tasks] + [(q, "quest") for q in all_quests] + [(ql, "quest_line") for ql in all_qls]
-        newly_available = [
-            {"type": itype, "id": i.id, "title": i.title, "deferred_until": str(i.defer_until)}
-            for i, itype in all_shown
-            if i.defer_until and i.defer_until <= today
-        ]
-        if newly_available:
-            flags["newly_available"] = newly_available
-
-        data: dict = {
-            "quest_lines": compact_list(quest_lines),
-            "quests": compact_list(quests),
-            "tasks": compact_list(relevant_tasks),
+    def _task_dict(t) -> dict:
+        return {
+            "id": t.id,
+            "title": t.title,
+            "threat_level": t.threat_level,
+            "energy": t.energy,
+            "due_days": (t.due_date - today).days if t.due_date else None,
+            "deadline_type": t.deadline_type,
         }
-        if flags:
-            data["flags"] = flags
-        prompt = f"Here are the user's {active_tier} quests, quest lines, tasks, and any flags. Skip the overview — go straight to suggesting the most appropriate task(s) to work on next, with brief reasoning. If there are flags, surface any urgent ones concisely before the suggestion.\n\n" + json.dumps(data, indent=2)
-        notes = []
-        if hidden:
-            notes.append(f"{hidden} quest(s)/quest line(s) are hidden because they exceed the user's current energy level ({energy_level}).")
-        if deferred_count:
-            notes.append(f"{deferred_count} quest(s)/quest line(s) are deferred and not shown.")
-        if notes:
-            prompt += "\n\nNote: " + " ".join(notes)
-        return prompt, hidden
 
-    return None, 0
+    def _quest_dict(q) -> dict:
+        return {
+            "id": q.id,
+            "title": q.title,
+            "status": q.status,
+            "tasks": [_task_dict(t) for t in tasks_by_quest.get(q.id, [])],
+        }
+
+    quest_lines_data = []
+    for ql in tracked_qls:
+        ql_quests = [q for q in all_quests if q.quest_line_id == ql.id and q.status != "done" and _within_energy(q.energy, energy_level)]
+        quest_lines_data.append({
+            "id": ql.id,
+            "title": ql.title,
+            "quests": [_quest_dict(q) for q in ql_quests],
+        })
+
+    standalone = [_quest_dict(q) for q in tracked_quests if q.quest_line_id not in tracked_ql_ids]
+
+    return {
+        "quest_lines": quest_lines_data,
+        "standalone_quests": standalone,
+        "questless_tasks": [_task_dict(t) for t in questless_tasks],
+        "hidden": hidden,
+        "deferred": deferred,
+    }
 
 
 @agent.system_prompt
@@ -237,9 +136,15 @@ These fields apply to tasks, quests, AND quest lines unless noted:
 - `deadline_note`: consequence or fallback if deadline is missed
 - `defer_until`: hide from radar until this date
 - `energy`: low / medium / high — context needed to engage with this item
+- `threat_level` (tasks only): high / medium (default) / low — urgency/importance of the task; high-threat tasks should be surfaced prominently on the quests page
 - `recurrence`: days between expected recurrences (track via last_reviewed)
 - `review_interval`: days between reviews — quest lines support this just like tasks and quests; call mark_reviewed after genuinely reviewing an item
 - `notes`: your working memory on an item — observations, hunches, context across conversations
+- `context_tags` (tasks only): list of context strings that surface the task on the dashboard (e.g. ["Needs to happen today", "Self-care options", "Deep focus"]). Set when tagging tasks for the dashboard; clear (empty list) when no longer relevant.
+- `evaluated` (tasks only): set true when you have reviewed and confirmed a task's completion — distinct from the user simply marking it done via the dashboard button.
+
+## Dashboard
+When the user asks you to suggest tasks for the dashboard, set `context_tags` on relevant tasks. Tags are flexible strings describing the context in which the task fits best. Keep tag names consistent across tasks so they group into the same card. Clear tags (pass an empty list) from tasks that are no longer relevant suggestions.
 
 ## Behaviour
 - Summarise meaningfully — don't just read lists back.
@@ -247,7 +152,7 @@ These fields apply to tasks, quests, AND quest lines unless noted:
 - Call `mark_reviewed` after genuinely reviewing an item, not on passive reads.
 - When reviewing items, present one at a time. Do not list everything due for review — use `next_review_item` and present only that item, then wait for the user to respond before moving on.
 - For initial overviews, give a high-level summary. When task data is already provided in the prompt, use it directly — do not call list_tasks again. Only call list_tasks when the user explicitly asks for tasks not already in context.
-- When creating a quest or quest line, always suggest a status tier (tracked/current/available) based on what the user said, and confirm before creating — do not default to available without saying so.
+- When creating a quest or quest line, the `status` field is required — always choose a tier (tracked/current/available) based on what the user said and confirm your choice before creating. Never assume available without saying so.
 - When creating a quest that does not belong to a quest line, suggest a review interval (in days) before creating it — standalone quests have no parent to ensure they get revisited.
 - Use get_next_item to advance through the review queue. It returns inbox items first, then scheduled review items, then None when everything is clear.
 - Verbal acknowledgment is never enough. If the user says "close it", "handled", "discard", "skip", "move on", or similar about an inbox item, you MUST call update_inbox_item before saying anything else. No exceptions.
@@ -308,13 +213,14 @@ async def create_task(
     recurrence: int | None = None,
     review_interval: int | None = None,
     size: int | None = None,
+    threat_level: str = "medium",
 ) -> Task:
-    """Create a single action. Tasks belong to quests (quest_id), never directly to quest lines. Size uses Fibonacci scale: 1, 2, 3, 5, 8, 13, 21."""
+    """Create a single action. Tasks belong to quests (quest_id), never directly to quest lines. Size uses Fibonacci scale: 1, 2, 3, 5, 8, 13, 21. threat_level: high / medium (default) / low."""
     response_cache.invalidate()
     return compact(ctx.deps.tasks.create(
         title, description, due_date, quest_id,
         deadline_type, deadline_note, defer_until,
-        energy, recurrence, review_interval, size,
+        energy, recurrence, review_interval, size, threat_level,
     ))
 
 
@@ -341,13 +247,17 @@ async def update_task(
     notes: str | None = None,
     size: int | None = None,
     quest_id: str | None = None,
+    threat_level: str | None = None,
+    context_tags: list[str] | None = None,
+    evaluated: bool | None = None,
 ) -> Task | None:
-    """Update any fields on a task. Valid statuses: todo, in_progress, done."""
+    """Update any fields on a task. Valid statuses: todo, in_progress, done. threat_level: high / medium / low. context_tags: list of context strings for the dashboard (pass [] to clear). evaluated: set true when you have reviewed the completion."""
     response_cache.invalidate()
     result = ctx.deps.tasks.update(
         task_id, title, status, description, due_date,
         deadline_type, deadline_note, defer_until,
-        energy, recurrence, review_interval, notes, size, quest_id,
+        energy, recurrence, review_interval, notes, size, quest_id, threat_level,
+        context_tags, evaluated,
     )
     return compact(result) if result else None
 
@@ -358,12 +268,12 @@ async def update_task(
 async def create_quest(
     ctx: RunContext[AppDeps],
     title: str,
+    status: str,
     description: str | None = None,
-    status: str = "available",
     quest_line_id: str | None = None,
     size: int | None = None,
 ) -> Quest:
-    """Create a multi-step outcome. Valid statuses: available, current, tracked, done. Size uses Fibonacci scale: 1, 2, 3, 5, 8, 13, 21."""
+    """Create a multi-step outcome. status is required — choose: available, current, tracked, or done. Size uses Fibonacci scale: 1, 2, 3, 5, 8, 13, 21."""
     response_cache.invalidate()
     return compact(ctx.deps.quests.create(title, description, status, quest_line_id, size))
 
@@ -412,10 +322,10 @@ async def update_quest(
 async def create_quest_line(
     ctx: RunContext[AppDeps],
     title: str,
+    status: str,
     description: str | None = None,
-    status: str = "available",
 ) -> QuestLine:
-    """Create a long-running project. Valid statuses: available, current, tracked, done."""
+    """Create a long-running project. status is required — choose: available, current, tracked, or done."""
     response_cache.invalidate()
     return compact(ctx.deps.quest_lines.create(title, description, status))
 
@@ -478,12 +388,6 @@ async def flag_for_review(ctx: RunContext[AppDeps], item_type: str, item_id: str
     elif item_type == "quest_line":
         return ctx.deps.quest_lines.flag_for_review(item_id) is not None
     return False
-
-
-@agent.tool
-async def radar(ctx: RunContext[AppDeps]) -> dict:
-    """Get a structured overview of everything that needs attention: overdue deadlines, upcoming deadlines, items overdue for review, newly undeferred items, and recurring items due."""
-    return get_radar()
 
 
 @agent.tool
@@ -610,7 +514,6 @@ _SKIP_FIELDS = {"id", "created_at", "completed_at", "last_reviewed", "title", "c
 _CREATE_TOOLS = {"create_task", "create_quest", "create_quest_line", "create_subject", "create_inbox_item"}
 
 def extract_tool_events(result) -> list[str]:
-    # Collect tool return values keyed by tool_call_id
     returns: dict[str, any] = {}
     for msg in result.all_messages():
         for part in getattr(msg, "parts", []):
@@ -637,7 +540,6 @@ def extract_tool_events(result) -> list[str]:
                 args = {}
             ret = returns.get(getattr(part, "tool_call_id", None))
 
-            # Get item name from return value (most reliable) or args
             item_name = None
             if isinstance(ret, dict):
                 item_name = ret.get("title") or ret.get("content")
@@ -645,13 +547,11 @@ def extract_tool_events(result) -> list[str]:
                 item_name = args.get("title") or args.get("content")
 
             if name in _CREATE_TOOLS:
-                # For creates, show all meaningful fields from the return value
                 if isinstance(ret, dict):
                     changes = {k: v for k, v in ret.items() if k not in _SKIP_FIELDS and v is not None}
                 else:
                     changes = {k: v for k, v in args.items() if k not in _ID_ARGS and v is not None and k not in ("title", "content")}
             else:
-                # For updates, show what was explicitly changed
                 changes = {k: v for k, v in args.items() if k not in _ID_ARGS and v is not None and k not in ("title", "content")}
 
             parts_str = label
@@ -698,11 +598,13 @@ class ChatRequest(BaseModel):
     message: str
     history: list[HistoryMessage] = []
     energy_level: str | None = None
+    mode: str | None = None
 
 
 class ChatResponse(BaseModel):
     response: str
     tool_events: list[str] = []
+    quest_data: dict | None = None
 
 
 class InboxRequest(BaseModel):
@@ -734,19 +636,13 @@ class InitialRequest(BaseModel):
 
 @app.post("/initial")
 async def initial(request: InitialRequest) -> ChatResponse:
-    if not request.force:
-        cached = response_cache.get(request.mode)
-        if cached:
-            return ChatResponse(response=cached)
-    prompt, hidden = build_initial_prompt(request.mode, request.energy_level)
-    if prompt is None:
-        return ChatResponse(response=_empty_message(request.mode, hidden, request.energy_level))
-    modified_before = response_cache._last_modified
-    result = await agent.run(prompt, deps=deps, model_settings=CACHE_SETTINGS)
-    log_run(f"initial:{request.mode}", result)
-    if response_cache._last_modified == modified_before:
-        response_cache.set(request.mode, result.output)
-    return ChatResponse(response=result.output, tool_events=extract_tool_events(result))
+    if request.mode == "processing":
+        summary = build_review_summary(deps.inbox, deps.subjects, request.energy_level)
+        return ChatResponse(response=summary)
+
+    if request.mode == "quests":
+        data = build_quest_data(deps.quest_lines, deps.quests, deps.tasks, request.energy_level)
+        return ChatResponse(response="", quest_data=data)
 
 
 @app.post("/chat")
@@ -755,6 +651,49 @@ async def chat(request: ChatRequest) -> ChatResponse:
     message = request.message
     if request.energy_level:
         message = f"[My current energy level: {request.energy_level}]\n{message}"
-    result = await agent.run(message, deps=deps, message_history=history, model_settings=CACHE_SETTINGS)
+    model_override = "anthropic:claude-haiku-4-5-20251001" if request.mode == "processing" else None
+    result = await agent.run(
+        message, deps=deps, message_history=history,
+        model_settings=CACHE_SETTINGS, model=model_override,
+    )
     log_run("chat", result)
     return ChatResponse(response=result.output, tool_events=extract_tool_events(result))
+
+
+@app.get("/dashboard")
+async def dashboard() -> dict:
+    today = date.today()
+    all_tasks = deps.tasks.list()
+    active = [
+        t for t in all_tasks
+        if t.status not in ("done",)
+        and t.context_tags
+        and not (t.defer_until and t.defer_until > today)
+    ]
+
+    groups: dict[str, list] = {}
+    for task in active:
+        td = {
+            "id": task.id,
+            "title": task.title,
+            "threat_level": task.threat_level,
+            "energy": task.energy,
+            "due_days": (task.due_date - today).days if task.due_date else None,
+            "deadline_type": task.deadline_type,
+        }
+        for tag in task.context_tags:
+            groups.setdefault(tag, []).append(td)
+
+    return {"groups": [{"tag": tag, "tasks": tasks} for tag, tasks in groups.items()]}
+
+
+@app.post("/tasks/{task_id}/complete")
+async def complete_task(task_id: str) -> dict:
+    result = deps.tasks.update(task_id, status="done")
+    response_cache.invalidate()
+    return {"ok": True} if result else {"ok": False}
+
+
+# Serve frontend static files — must be mounted last, after all API routes.
+if os.path.isdir("frontend/dist"):
+    app.mount("/", StaticFiles(directory="frontend/dist", html=True), name="static")

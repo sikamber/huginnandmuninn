@@ -1,0 +1,6 @@
+{$DOMAIN} {
+    basic_auth {
+        {$AUTH_USER} {$AUTH_HASH}
+    }
+    reverse_proxy app:8000
+}

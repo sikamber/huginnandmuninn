@@ -1,6 +1,10 @@
+from __future__ import annotations
+
 from datetime import date, datetime
 from uuid import uuid4
 
+from sqlalchemy import Column
+from sqlalchemy import JSON
 from sqlmodel import Field, Session, SQLModel, col, select
 
 from database import engine
@@ -21,9 +25,12 @@ class Task(SQLModel, table=True):
     review_interval: int | None = None
     notes: str | None = None
     size: int | None = None
+    threat_level: str = "medium"
     quest_id: str | None = Field(default=None, foreign_key="quest.id")
     created_at: datetime = Field(default_factory=datetime.now)
     completed_at: datetime | None = None
+    context_tags: list[str] | None = Field(default=None, sa_column=Column(JSON, nullable=True))
+    evaluated: bool = Field(default=False)
 
 
 class TaskStore:
@@ -40,6 +47,7 @@ class TaskStore:
         recurrence: int | None = None,
         review_interval: int | None = None,
         size: int | None = None,
+        threat_level: str = "medium",
     ) -> Task:
         task = Task(
             title=title,
@@ -53,6 +61,7 @@ class TaskStore:
             recurrence=recurrence,
             review_interval=review_interval,
             size=size,
+            threat_level=threat_level,
         )
         with Session(engine) as session:
             session.add(task)
@@ -86,6 +95,9 @@ class TaskStore:
         notes: str | None = None,
         size: int | None = None,
         quest_id: str | None = None,
+        threat_level: str | None = None,
+        context_tags: list[str] | None = None,
+        evaluated: bool | None = None,
     ) -> Task | None:
         with Session(engine) as session:
             task = session.get(Task, task_id)
@@ -118,6 +130,12 @@ class TaskStore:
                 task.size = size
             if quest_id is not None:
                 task.quest_id = quest_id
+            if threat_level is not None:
+                task.threat_level = threat_level
+            if context_tags is not None:
+                task.context_tags = context_tags
+            if evaluated is not None:
+                task.evaluated = evaluated
             session.add(task)
             session.commit()
             session.refresh(task)
