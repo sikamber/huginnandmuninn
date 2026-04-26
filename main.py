@@ -243,7 +243,9 @@ async def create_task(
 
 @agent.tool
 async def list_tasks(ctx: RunContext[AppDeps], include_old_completed: bool = False) -> list[dict]:
-    """List tasks as a compact summary. By default excludes tasks completed before today."""
+    """List tasks as a compact summary. By default includes active tasks and tasks completed today
+    (done/evaluated with no date means completed today). Pass include_old_completed=True to include
+    older completed tasks — those will have a completed_at date."""
     today = date.today()
     tasks = ctx.deps.tasks.list(include_old_completed)
     result = []
@@ -261,6 +263,8 @@ async def list_tasks(ctx: RunContext[AppDeps], include_old_completed: bool = Fal
             d["user_review"] = str(t.next_user_review)
         if t.next_ai_review:
             d["ai_review"] = str(t.next_ai_review)
+        if include_old_completed and t.completed_at:
+            d["completed_at"] = t.completed_at.strftime("%Y-%m-%d")
         result.append(d)
     return result
 
