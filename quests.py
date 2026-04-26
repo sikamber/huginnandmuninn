@@ -1,4 +1,4 @@
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from uuid import uuid4
 
 from sqlmodel import Field, Session, SQLModel, col, select
@@ -13,12 +13,13 @@ class QuestLine(SQLModel, table=True):
     status: str = "available"
     due_date: date | None = None
     deadline_type: str | None = None
-    deadline_note: str | None = None
     defer_until: date | None = None
     energy: str | None = None
     recurrence: int | None = None
-    last_reviewed: date | None = None
-    review_interval: int | None = None
+    next_user_review: date | None = None
+    user_review_notes: str | None = None
+    next_ai_review: date | None = None
+    ai_review_notes: str | None = None
     notes: str | None = None
     created_at: datetime = Field(default_factory=datetime.now)
 
@@ -30,12 +31,13 @@ class Quest(SQLModel, table=True):
     status: str = "available"
     due_date: date | None = None
     deadline_type: str | None = None
-    deadline_note: str | None = None
     defer_until: date | None = None
     energy: str | None = None
     recurrence: int | None = None
-    last_reviewed: date | None = None
-    review_interval: int | None = None
+    next_user_review: date | None = None
+    user_review_notes: str | None = None
+    next_ai_review: date | None = None
+    ai_review_notes: str | None = None
     notes: str | None = None
     size: int | None = None
     quest_line_id: str | None = Field(default=None, foreign_key="questline.id")
@@ -66,11 +68,13 @@ class QuestLineStore:
         description: str | None = None,
         due_date: date | None = None,
         deadline_type: str | None = None,
-        deadline_note: str | None = None,
         defer_until: date | None = None,
         energy: str | None = None,
         recurrence: int | None = None,
-        review_interval: int | None = None,
+        next_user_review: date | None = None,
+        user_review_notes: str | None = None,
+        next_ai_review: date | None = None,
+        ai_review_notes: str | None = None,
         notes: str | None = None,
     ) -> QuestLine | None:
         with Session(engine) as session:
@@ -87,16 +91,20 @@ class QuestLineStore:
                 quest_line.due_date = due_date
             if deadline_type is not None:
                 quest_line.deadline_type = deadline_type
-            if deadline_note is not None:
-                quest_line.deadline_note = deadline_note
             if defer_until is not None:
                 quest_line.defer_until = defer_until
             if energy is not None:
                 quest_line.energy = energy
             if recurrence is not None:
                 quest_line.recurrence = recurrence
-            if review_interval is not None:
-                quest_line.review_interval = review_interval
+            if next_user_review is not None:
+                quest_line.next_user_review = next_user_review
+            if user_review_notes is not None:
+                quest_line.user_review_notes = user_review_notes
+            if next_ai_review is not None:
+                quest_line.next_ai_review = next_ai_review
+            if ai_review_notes is not None:
+                quest_line.ai_review_notes = ai_review_notes
             if notes is not None:
                 quest_line.notes = notes
             session.add(quest_line)
@@ -109,7 +117,7 @@ class QuestLineStore:
             quest_line = session.get(QuestLine, quest_line_id)
             if not quest_line:
                 return None
-            quest_line.last_reviewed = date.today()
+            quest_line.next_user_review = date.today() + timedelta(days=7)
             session.add(quest_line)
             session.commit()
             session.refresh(quest_line)
@@ -120,9 +128,7 @@ class QuestLineStore:
             quest_line = session.get(QuestLine, quest_line_id)
             if not quest_line:
                 return None
-            quest_line.last_reviewed = None
-            if not quest_line.review_interval:
-                quest_line.review_interval = 1
+            quest_line.next_user_review = date.today()
             session.add(quest_line)
             session.commit()
             session.refresh(quest_line)
@@ -162,11 +168,13 @@ class QuestStore:
         description: str | None = None,
         due_date: date | None = None,
         deadline_type: str | None = None,
-        deadline_note: str | None = None,
         defer_until: date | None = None,
         energy: str | None = None,
         recurrence: int | None = None,
-        review_interval: int | None = None,
+        next_user_review: date | None = None,
+        user_review_notes: str | None = None,
+        next_ai_review: date | None = None,
+        ai_review_notes: str | None = None,
         notes: str | None = None,
         quest_line_id: str | None = None,
         size: int | None = None,
@@ -185,16 +193,20 @@ class QuestStore:
                 quest.due_date = due_date
             if deadline_type is not None:
                 quest.deadline_type = deadline_type
-            if deadline_note is not None:
-                quest.deadline_note = deadline_note
             if defer_until is not None:
                 quest.defer_until = defer_until
             if energy is not None:
                 quest.energy = energy
             if recurrence is not None:
                 quest.recurrence = recurrence
-            if review_interval is not None:
-                quest.review_interval = review_interval
+            if next_user_review is not None:
+                quest.next_user_review = next_user_review
+            if user_review_notes is not None:
+                quest.user_review_notes = user_review_notes
+            if next_ai_review is not None:
+                quest.next_ai_review = next_ai_review
+            if ai_review_notes is not None:
+                quest.ai_review_notes = ai_review_notes
             if notes is not None:
                 quest.notes = notes
             if quest_line_id is not None:
@@ -211,7 +223,7 @@ class QuestStore:
             quest = session.get(Quest, quest_id)
             if not quest:
                 return None
-            quest.last_reviewed = date.today()
+            quest.next_user_review = date.today() + timedelta(days=7)
             session.add(quest)
             session.commit()
             session.refresh(quest)
@@ -222,9 +234,7 @@ class QuestStore:
             quest = session.get(Quest, quest_id)
             if not quest:
                 return None
-            quest.last_reviewed = None
-            if not quest.review_interval:
-                quest.review_interval = 1
+            quest.next_user_review = date.today()
             session.add(quest)
             session.commit()
             session.refresh(quest)

@@ -15,6 +15,53 @@
   --heading: system-ui, 'Segoe UI', Roboto, sans-serif;
   --mono: ui-monospace, Consolas, monospace;
 
+  /* App colour tokens — light */
+  --c-text-primary:   #111827;
+  --c-text-secondary: #374151;
+  --c-text-muted:     #6b7280;
+  --c-text-dim:       #9ca3af;
+
+  --c-bg-card:   #ffffff;
+  --c-bg-subtle: #f8fafc;
+  --c-bg-muted:  #f3f4f6;
+
+  --c-border:       #e5e7eb;
+  --c-border-light: #f3f4f6;
+  --c-input-border: #d1d5db;
+  --c-input-bg:     #ffffff;
+
+  --c-bubble-ai:      #f0f0f0;
+  --c-bubble-ai-text: #111827;
+
+  --c-tool-bg:     #eef4ff;
+  --c-tool-color:  #4a6fa5;
+  --c-tool-border: #99bbee;
+
+  --c-badge-bg:    #e0f2fe;
+  --c-badge-color: #0369a1;
+
+  --c-review-note-bg:    #e0f2fe;
+  --c-review-note-color: #0369a1;
+
+  --c-chip-danger-bg:     #fee2e2;
+  --c-chip-danger-text:   #991b1b;
+  --c-chip-danger-border: #fca5a5;
+
+  --c-chip-warn-bg:     #fef3c7;
+  --c-chip-warn-text:   #92400e;
+  --c-chip-warn-border: #fcd34d;
+
+  --c-chip-neutral-bg:     #f3f4f6;
+  --c-chip-neutral-text:   #6b7280;
+  --c-chip-neutral-border: #d1d5db;
+
+  --c-chip-success-bg:     #dcfce7;
+  --c-chip-success-text:   #166534;
+  --c-chip-success-border: #86efac;
+
+  --c-btn-inactive-bg:   #eeeeee;
+  --c-btn-inactive-text: #333333;
+
   font: 18px/145% var(--sans);
   letter-spacing: 0.18px;
   color-scheme: light dark;
@@ -43,11 +90,62 @@
     --social-bg: rgba(47, 48, 58, 0.5);
     --shadow:
       rgba(0, 0, 0, 0.4) 0 10px 15px -3px, rgba(0, 0, 0, 0.25) 0 4px 6px -2px;
+
+    /* App colour tokens — dark */
+    --c-text-primary:   #f3f4f6;
+    --c-text-secondary: #d1d5db;
+    --c-text-muted:     #9ca3af;
+    --c-text-dim:       #6b7280;
+
+    --c-bg-card:   #1f2128;
+    --c-bg-subtle: #191c25;
+    --c-bg-muted:  #2d3748;
+
+    --c-border:       #374151;
+    --c-border-light: #2d3748;
+    --c-input-border: #4b5563;
+    --c-input-bg:     #1f2128;
+
+    --c-bubble-ai:      #2a2d3a;
+    --c-bubble-ai-text: #e2e8f0;
+
+    --c-tool-bg:     #1a2540;
+    --c-tool-color:  #93b4e8;
+    --c-tool-border: #3d6494;
+
+    --c-badge-bg:    #0c2a42;
+    --c-badge-color: #60a5fa;
+
+    --c-review-note-bg:    #0c2a42;
+    --c-review-note-color: #60a5fa;
+
+    --c-chip-danger-bg:     #450a0a;
+    --c-chip-danger-text:   #fca5a5;
+    --c-chip-danger-border: #7f1d1d;
+
+    --c-chip-warn-bg:     #451a03;
+    --c-chip-warn-text:   #fcd34d;
+    --c-chip-warn-border: #78350f;
+
+    --c-chip-neutral-bg:     #1f2937;
+    --c-chip-neutral-text:   #9ca3af;
+    --c-chip-neutral-border: #374151;
+
+    --c-chip-success-bg:     #052e16;
+    --c-chip-success-text:   #86efac;
+    --c-chip-success-border: #14532d;
+
+    --c-btn-inactive-bg:   #2d3748;
+    --c-btn-inactive-text: #d1d5db;
   }
 
   #social .button-icon {
     filter: invert(1) brightness(2);
   }
+
+  table th { background: #1f2128; }
+  table tr:nth-child(even) { background: #191c25; }
+  table th, table td { border-color: #374151; }
 }
 
 #root {

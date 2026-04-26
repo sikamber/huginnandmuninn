@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from uuid import uuid4
 
 from sqlalchemy import Column
@@ -14,15 +14,16 @@ class Task(SQLModel, table=True):
     id: str = Field(default_factory=lambda: str(uuid4()), primary_key=True)
     title: str
     description: str | None = None
-    status: str = "todo"
+    status: str = "todo"  # todo | in_progress | done | evaluated
     due_date: date | None = None
     deadline_type: str | None = None
-    deadline_note: str | None = None
     defer_until: date | None = None
     energy: str | None = None
     recurrence: int | None = None
-    last_reviewed: date | None = None
-    review_interval: int | None = None
+    next_user_review: date | None = None
+    user_review_notes: str | None = None
+    next_ai_review: date | None = None
+    ai_review_notes: str | None = None
     notes: str | None = None
     size: int | None = None
     threat_level: str = "medium"
@@ -30,7 +31,6 @@ class Task(SQLModel, table=True):
     created_at: datetime = Field(default_factory=datetime.now)
     completed_at: datetime | None = None
     context_tags: list[str] | None = Field(default=None, sa_column=Column(JSON, nullable=True))
-    evaluated: bool = Field(default=False)
 
 
 class TaskStore:
@@ -41,11 +41,13 @@ class TaskStore:
         due_date: date | None = None,
         quest_id: str | None = None,
         deadline_type: str | None = None,
-        deadline_note: str | None = None,
         defer_until: date | None = None,
         energy: str | None = None,
         recurrence: int | None = None,
-        review_interval: int | None = None,
+        next_user_review: date | None = None,
+        user_review_notes: str | None = None,
+        next_ai_review: date | None = None,
+        ai_review_notes: str | None = None,
         size: int | None = None,
         threat_level: str = "medium",
     ) -> Task:
@@ -55,11 +57,13 @@ class TaskStore:
             due_date=due_date,
             quest_id=quest_id,
             deadline_type=deadline_type,
-            deadline_note=deadline_note,
             defer_until=defer_until,
             energy=energy,
             recurrence=recurrence,
-            review_interval=review_interval,
+            next_user_review=next_user_review,
+            user_review_notes=user_review_notes,
+            next_ai_review=next_ai_review,
+            ai_review_notes=ai_review_notes,
             size=size,
             threat_level=threat_level,
         )
@@ -87,17 +91,18 @@ class TaskStore:
         description: str | None = None,
         due_date: date | None = None,
         deadline_type: str | None = None,
-        deadline_note: str | None = None,
         defer_until: date | None = None,
         energy: str | None = None,
         recurrence: int | None = None,
-        review_interval: int | None = None,
+        next_user_review: date | None = None,
+        user_review_notes: str | None = None,
+        next_ai_review: date | None = None,
+        ai_review_notes: str | None = None,
         notes: str | None = None,
         size: int | None = None,
         quest_id: str | None = None,
         threat_level: str | None = None,
         context_tags: list[str] | None = None,
-        evaluated: bool | None = None,
     ) -> Task | None:
         with Session(engine) as session:
             task = session.get(Task, task_id)
@@ -107,23 +112,31 @@ class TaskStore:
                 task.title = title
             if status is not None:
                 task.status = status
-                task.completed_at = datetime.now() if status == "done" else None
+                if status in ("done", "evaluated"):
+                    if task.completed_at is None:
+                        task.completed_at = datetime.now()
+                else:
+                    task.completed_at = None
             if description is not None:
                 task.description = description
             if due_date is not None:
                 task.due_date = due_date
             if deadline_type is not None:
                 task.deadline_type = deadline_type
-            if deadline_note is not None:
-                task.deadline_note = deadline_note
             if defer_until is not None:
                 task.defer_until = defer_until
             if energy is not None:
                 task.energy = energy
             if recurrence is not None:
                 task.recurrence = recurrence
-            if review_interval is not None:
-                task.review_interval = review_interval
+            if next_user_review is not None:
+                task.next_user_review = next_user_review
+            if user_review_notes is not None:
+                task.user_review_notes = user_review_notes
+            if next_ai_review is not None:
+                task.next_ai_review = next_ai_review
+            if ai_review_notes is not None:
+                task.ai_review_notes = ai_review_notes
             if notes is not None:
                 task.notes = notes
             if size is not None:
@@ -134,8 +147,6 @@ class TaskStore:
                 task.threat_level = threat_level
             if context_tags is not None:
                 task.context_tags = context_tags
-            if evaluated is not None:
-                task.evaluated = evaluated
             session.add(task)
             session.commit()
             session.refresh(task)
@@ -146,7 +157,7 @@ class TaskStore:
             task = session.get(Task, task_id)
             if not task:
                 return None
-            task.last_reviewed = date.today()
+            task.next_user_review = date.today() + timedelta(days=7)
             session.add(task)
             session.commit()
             session.refresh(task)
@@ -157,9 +168,7 @@ class TaskStore:
             task = session.get(Task, task_id)
             if not task:
                 return None
-            task.last_reviewed = None
-            if not task.review_interval:
-                task.review_interval = 1
+            task.next_user_review = date.today()
             session.add(task)
             session.commit()
             session.refresh(task)

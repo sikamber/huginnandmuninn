@@ -8,6 +8,10 @@ from quests import Quest, QuestLine
 from subjects import Subject
 from tasks import Task
 
+_ACTIVE_TASK = (col(Task.status) != "done") & (col(Task.status) != "evaluated")
+_ACTIVE_QUEST = col(Quest.status) != "done"
+_ACTIVE_QL = col(QuestLine.status) != "done"
+
 
 def get_critical_items(today: date | None = None) -> list[dict]:
     """Returns items needing immediate attention with a reason for each."""
@@ -15,9 +19,9 @@ def get_critical_items(today: date | None = None) -> list[dict]:
         today = date.today()
 
     with Session(engine) as session:
-        tasks = list(session.exec(select(Task).where(col(Task.status) != "done")).all())
-        quests = list(session.exec(select(Quest).where(col(Quest.status) != "done")).all())
-        quest_lines = list(session.exec(select(QuestLine).where(col(QuestLine.status) != "done")).all())
+        tasks = list(session.exec(select(Task).where(_ACTIVE_TASK)).all())
+        quests = list(session.exec(select(Quest).where(_ACTIVE_QUEST)).all())
+        quest_lines = list(session.exec(select(QuestLine).where(_ACTIVE_QL)).all())
         done_quests = list(session.exec(select(Quest).where(col(Quest.status) == "done")).all())
         done_quest_lines = list(session.exec(select(QuestLine).where(col(QuestLine.status) == "done")).all())
         urgent_inbox = list(session.exec(
@@ -78,31 +82,19 @@ def get_critical_items(today: date | None = None) -> list[dict]:
 
 
 def count_review_items(today: date | None = None) -> int:
-    """Count items currently due for routine review."""
+    """Count items currently due for user review."""
     if today is None:
         today = date.today()
 
-    count = 0
     with Session(engine) as session:
-        tasks = list(session.exec(select(Task).where(col(Task.status) != "done")).all())
-        quests = list(session.exec(select(Quest).where(col(Quest.status) != "done")).all())
-        quest_lines = list(session.exec(select(QuestLine).where(col(QuestLine.status) != "done")).all())
+        tasks = list(session.exec(select(Task).where(_ACTIVE_TASK)).all())
+        quests = list(session.exec(select(Quest).where(_ACTIVE_QUEST)).all())
+        quest_lines = list(session.exec(select(QuestLine).where(_ACTIVE_QL)).all())
 
-    for item_type, item in (
-        [("task", t) for t in tasks]
-        + [("quest", q) for q in quests]
-        + [("quest_line", ql) for ql in quest_lines]
-    ):
-        if item.review_interval:
-            baseline = item.last_reviewed if item.last_reviewed else item.created_at.date()
-            days_overdue = (today - baseline).days - item.review_interval
-        elif item_type == "task" and item.last_reviewed is None:
-            days_overdue = (today - item.created_at.date()).days - 7
-        else:
-            continue
-        if days_overdue >= 0:
-            count += 1
-    return count
+    return sum(
+        1 for item in tasks + quests + quest_lines
+        if item.next_user_review and item.next_user_review <= today
+    )
 
 
 def get_next_review_item(today: date | None = None) -> dict | None:
@@ -112,23 +104,17 @@ def get_next_review_item(today: date | None = None) -> dict | None:
     candidates = []
 
     with Session(engine) as session:
-        tasks = list(session.exec(select(Task).where(col(Task.status) != "done")).all())
-        quests = list(session.exec(select(Quest).where(col(Quest.status) != "done")).all())
-        quest_lines = list(session.exec(select(QuestLine).where(col(QuestLine.status) != "done")).all())
+        tasks = list(session.exec(select(Task).where(_ACTIVE_TASK)).all())
+        quests = list(session.exec(select(Quest).where(_ACTIVE_QUEST)).all())
+        quest_lines = list(session.exec(select(QuestLine).where(_ACTIVE_QL)).all())
 
     for item_type, item in (
         [("task", t) for t in tasks]
         + [("quest", q) for q in quests]
         + [("quest_line", ql) for ql in quest_lines]
     ):
-        if item.review_interval:
-            baseline = item.last_reviewed if item.last_reviewed else item.created_at.date()
-            days_overdue = (today - baseline).days - item.review_interval
-        elif item_type == "task" and item.last_reviewed is None:
-            days_overdue = (today - item.created_at.date()).days - 7
-        else:
-            continue
-        if days_overdue >= 0:
+        if item.next_user_review and item.next_user_review <= today:
+            days_overdue = (today - item.next_user_review).days
             candidates.append((days_overdue, item_type, item))
 
     if not candidates:
@@ -143,8 +129,9 @@ def get_next_review_item(today: date | None = None) -> dict | None:
         "title": item.title,
         "description": item.description,
         "notes": item.notes,
+        "user_review_notes": item.user_review_notes,
         "status": item.status,
-        "last_reviewed": str(item.last_reviewed) if item.last_reviewed else "never",
+        "next_user_review": str(item.next_user_review),
         "days_overdue": days_overdue,
     }
 
@@ -162,21 +149,58 @@ def get_next_review_item(today: date | None = None) -> dict | None:
     return result
 
 
+def get_ai_review_items(today: date | None = None) -> dict:
+    """Returns items needing AI review: completed tasks and items with next_ai_review due."""
+    if today is None:
+        today = date.today()
+
+    with Session(engine) as session:
+        done_tasks = list(session.exec(
+            select(Task).where(col(Task.status) == "done")
+        ).all())
+        ai_tasks = list(session.exec(
+            select(Task).where(
+                col(Task.next_ai_review) != None,
+                col(Task.next_ai_review) <= today,
+                _ACTIVE_TASK,
+            )
+        ).all())
+        ai_quests = list(session.exec(
+            select(Quest).where(
+                col(Quest.next_ai_review) != None,
+                col(Quest.next_ai_review) <= today,
+                _ACTIVE_QUEST,
+            )
+        ).all())
+        ai_qls = list(session.exec(
+            select(QuestLine).where(
+                col(QuestLine.next_ai_review) != None,
+                col(QuestLine.next_ai_review) <= today,
+                _ACTIVE_QL,
+            )
+        ).all())
+
+    return {
+        "done_tasks": [
+            {"id": t.id, "title": t.title, "description": t.description, "notes": t.notes}
+            for t in done_tasks
+        ],
+        "ai_review_items": (
+            [{"type": "task", "id": t.id, "title": t.title, "ai_review_notes": t.ai_review_notes} for t in ai_tasks]
+            + [{"type": "quest", "id": q.id, "title": q.title, "ai_review_notes": q.ai_review_notes} for q in ai_quests]
+            + [{"type": "quest_line", "id": ql.id, "title": ql.title, "ai_review_notes": ql.ai_review_notes} for ql in ai_qls]
+        ),
+    }
+
+
 def get_no_oversight_items(today: date | None = None) -> list[dict]:
     if today is None:
         today = date.today()
 
-    no_oversight_rules = [
-        ("task", lambda t: t.quest_id is None and t.review_interval is None),
-        ("quest", lambda q: q.quest_line_id is None and q.review_interval is None),
-        ("quest_line", lambda ql: ql.review_interval is None),
-    ]
-    predicates = {label: pred for label, pred in no_oversight_rules}
-
     with Session(engine) as session:
-        tasks = list(session.exec(select(Task).where(col(Task.status) != "done")).all())
-        quests = list(session.exec(select(Quest).where(col(Quest.status) != "done")).all())
-        quest_lines = list(session.exec(select(QuestLine).where(col(QuestLine.status) != "done")).all())
+        tasks = list(session.exec(select(Task).where(_ACTIVE_TASK)).all())
+        quests = list(session.exec(select(Quest).where(_ACTIVE_QUEST)).all())
+        quest_lines = list(session.exec(select(QuestLine).where(_ACTIVE_QL)).all())
 
     result = []
     for item_type, item in (
@@ -184,8 +208,12 @@ def get_no_oversight_items(today: date | None = None) -> list[dict]:
         + [("quest", q) for q in quests]
         + [("quest_line", ql) for ql in quest_lines]
     ):
-        pred = predicates.get(item_type)
-        if pred and pred(item):
+        has_oversight = (
+            (item_type == "task" and (item.quest_id or item.next_user_review or item.next_ai_review))
+            or (item_type == "quest" and (item.quest_line_id or item.next_user_review or item.next_ai_review))
+            or (item_type == "quest_line" and (item.next_user_review or item.next_ai_review))
+        )
+        if not has_oversight:
             if item_type == "task" and (today - item.created_at.date()).days < 7:
                 continue
             result.append({"type": item_type, "id": item.id, "title": item.title})
@@ -194,9 +222,9 @@ def get_no_oversight_items(today: date | None = None) -> list[dict]:
 
 def get_empty_structure_items() -> dict:
     with Session(engine) as session:
-        tasks = list(session.exec(select(Task).where(col(Task.status) != "done")).all())
-        quests = list(session.exec(select(Quest).where(col(Quest.status) != "done")).all())
-        quest_lines = list(session.exec(select(QuestLine).where(col(QuestLine.status) != "done")).all())
+        tasks = list(session.exec(select(Task).where(_ACTIVE_TASK)).all())
+        quests = list(session.exec(select(Quest).where(_ACTIVE_QUEST)).all())
+        quest_lines = list(session.exec(select(QuestLine).where(_ACTIVE_QL)).all())
 
     task_count_by_quest: dict[str, int] = {}
     for task in tasks:
@@ -239,7 +267,7 @@ def build_review_summary(inbox_store, subject_store, energy_level: str | None = 
     if noncritical_inbox:
         counts.append(f"**{len(noncritical_inbox)} inbox item(s)** to process")
     if review_count:
-        counts.append(f"**{review_count} item(s)** due for routine review")
+        counts.append(f"**{review_count} item(s)** due for review")
     if counts:
         parts.append("\n".join(counts))
 
@@ -253,5 +281,4 @@ def build_review_summary(inbox_store, subject_store, energy_level: str | None = 
     if not parts:
         return "Everything looks clear — no critical items, no inbox, nothing due for review."
 
-    parts.append('Reply with "critical", "inbox", or "review" to start a flow, or just ask.')
     return "\n\n".join(parts)

@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("huginn")
 
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -24,16 +25,26 @@ from cache import response_cache
 from database import create_tables
 from deps import AppDeps
 from inbox import InboxStore
+from jobs import run_ai_review
 from quests import Quest, QuestLine, QuestLineStore, QuestStore
 from review import build_review_summary, count_review_items, get_next_review_item
 from subjects import Subject, SubjectStore
 from tasks import Task, TaskStore
 
+scheduler = AsyncIOScheduler(timezone="Europe/Copenhagen")
+
+
+async def _ai_review_job():
+    await run_ai_review(agent, deps)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     create_tables()
+    scheduler.add_job(_ai_review_job, "cron", hour=2, minute=0)
+    scheduler.start()
     yield
+    scheduler.shutdown()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -71,21 +82,20 @@ def build_quest_data(quest_line_store, quest_store, task_store, energy_level: st
     tasks_by_quest: dict[str, list] = {}
     questless_tasks = []
     for t in all_tasks:
-        if t.status != "done" and _within_energy(t.energy, energy_level) and not (t.defer_until and t.defer_until > today):
+        if t.status not in ("done", "evaluated") and _within_energy(t.energy, energy_level) and not (t.defer_until and t.defer_until > today):
             if t.quest_id:
                 tasks_by_quest.setdefault(t.quest_id, []).append(t)
             else:
                 questless_tasks.append(t)
 
     def _task_dict(t) -> dict:
-        return {
-            "id": t.id,
-            "title": t.title,
-            "threat_level": t.threat_level,
-            "energy": t.energy,
-            "due_days": (t.due_date - today).days if t.due_date else None,
-            "deadline_type": t.deadline_type,
-        }
+        d: dict = {"id": t.id, "title": t.title, "threat_level": t.threat_level}
+        if t.energy:
+            d["energy"] = t.energy
+        if t.due_date:
+            d["due_days"] = (t.due_date - today).days
+            d["deadline_type"] = t.deadline_type
+        return d
 
     def _quest_dict(q) -> dict:
         return {
@@ -130,18 +140,25 @@ def static_prompt() -> str:
 - **available**: exists but not currently being pursued
 - **done**: completed
 
+## Task status
+- **todo**: not started
+- **in_progress**: actively being worked on
+- **done**: completed by the user, pending AI evaluation
+- **evaluated**: confirmed complete by the AI review job
+
 ## Fields
 These fields apply to tasks, quests, AND quest lines unless noted:
 - `deadline_type`: hard (must happen by due_date) or soft (would like to by due_date)
-- `deadline_note`: consequence or fallback if deadline is missed
 - `defer_until`: hide from radar until this date
 - `energy`: low / medium / high — context needed to engage with this item
 - `threat_level` (tasks only): high / medium (default) / low — urgency/importance
-- `recurrence`: days between expected recurrences (track via last_reviewed)
-- `review_interval`: days between reviews
-- `notes`: your working memory on an item — observations, hunches, context across conversations
+- `recurrence`: days between expected recurrences
+- `next_user_review`: date the item should next surface for user review
+- `user_review_notes`: note shown to the user when this item surfaces for review
+- `next_ai_review`: date the AI job should next review this item (use for items that become critical or active at a future point)
+- `ai_review_notes`: context for the AI job when it reviews this item
+- `notes`: working memory on an item — observations, hunches, context across conversations
 - `context_tags` (tasks only): list of context strings for the dashboard (e.g. ["Needs to happen today", "Self-care options"]). Keep names consistent so tasks group into the same card. Pass [] to clear.
-- `evaluated` (tasks only): set true when you have reviewed and confirmed a completion — distinct from the user marking it done via the dashboard.
 
 ## Dashboard
 When the user asks you to suggest tasks for the dashboard, set `context_tags` on relevant tasks.
@@ -151,9 +168,10 @@ When the user asks you to suggest tasks for the dashboard, set `context_tags` on
 - Do not use emojis or emoticons.
 - For initial overviews, use data already in context — do not call list_tasks unless the user explicitly asks.
 - When creating a quest or quest line, `status` is required — choose tracked/current/available based on what the user said and confirm before creating.
-- When creating a standalone quest (no quest line), suggest a review interval before creating.
+- When creating a standalone quest (no quest line), suggest a next_user_review date before creating.
 - When the user says goodbye, create or update subjects to capture anything worth remembering. Ask if unsure.
-- When helping with a specific review item, the user controls advancing to the next item via the interface — do not call get_next_item or mark_reviewed yourself. Just help with what was asked and stop.
+- When helping with a specific review item, the user controls advancing to the next item via the interface — do not call mark_reviewed yourself. Just help with what was asked and stop.
+- When setting next_ai_review, write a clear ai_review_notes explaining what to check for at that date.
 
 ## Radar rules
 - Flag any quest line with no quests at status 'current' or 'tracked' — it may be stalled.
@@ -201,27 +219,50 @@ async def create_task(
     due_date: date | None = None,
     quest_id: str | None = None,
     deadline_type: str | None = None,
-    deadline_note: str | None = None,
     defer_until: date | None = None,
     energy: str | None = None,
     recurrence: int | None = None,
-    review_interval: int | None = None,
+    next_user_review: date | None = None,
+    user_review_notes: str | None = None,
+    next_ai_review: date | None = None,
+    ai_review_notes: str | None = None,
     size: int | None = None,
     threat_level: str = "medium",
 ) -> Task:
-    """Create a single action. Tasks belong to quests (quest_id), never directly to quest lines. Size uses Fibonacci scale: 1, 2, 3, 5, 8, 13, 21. threat_level: high / medium (default) / low."""
+    """Create a single action. Tasks belong to quests (quest_id), never directly to quest lines. Size uses Fibonacci scale: 1, 2, 3, 5, 8, 13, 21. threat_level: high / medium (default) / low. Set next_user_review to schedule user review; set next_ai_review for future AI monitoring."""
     response_cache.invalidate()
     return compact(ctx.deps.tasks.create(
         title, description, due_date, quest_id,
-        deadline_type, deadline_note, defer_until,
-        energy, recurrence, review_interval, size, threat_level,
+        deadline_type, defer_until,
+        energy, recurrence,
+        next_user_review, user_review_notes,
+        next_ai_review, ai_review_notes,
+        size, threat_level,
     ))
 
 
 @agent.tool
 async def list_tasks(ctx: RunContext[AppDeps], include_old_completed: bool = False) -> list[dict]:
-    """List tasks. By default excludes tasks completed before today."""
-    return compact_list(ctx.deps.tasks.list(include_old_completed))
+    """List tasks as a compact summary. By default excludes tasks completed before today."""
+    today = date.today()
+    tasks = ctx.deps.tasks.list(include_old_completed)
+    result = []
+    for t in tasks:
+        d: dict = {"id": t.id, "title": t.title, "status": t.status}
+        if t.energy:
+            d["energy"] = t.energy
+        if t.threat_level != "medium":
+            d["threat"] = t.threat_level
+        if t.due_date:
+            d["due_days"] = (t.due_date - today).days
+        if t.quest_id:
+            d["quest_id"] = t.quest_id
+        if t.next_user_review:
+            d["user_review"] = str(t.next_user_review)
+        if t.next_ai_review:
+            d["ai_review"] = str(t.next_ai_review)
+        result.append(d)
+    return result
 
 
 @agent.tool
@@ -233,25 +274,28 @@ async def update_task(
     description: str | None = None,
     due_date: date | None = None,
     deadline_type: str | None = None,
-    deadline_note: str | None = None,
     defer_until: date | None = None,
     energy: str | None = None,
     recurrence: int | None = None,
-    review_interval: int | None = None,
+    next_user_review: date | None = None,
+    user_review_notes: str | None = None,
+    next_ai_review: date | None = None,
+    ai_review_notes: str | None = None,
     notes: str | None = None,
     size: int | None = None,
     quest_id: str | None = None,
     threat_level: str | None = None,
     context_tags: list[str] | None = None,
-    evaluated: bool | None = None,
 ) -> Task | None:
-    """Update any fields on a task. Valid statuses: todo, in_progress, done. threat_level: high / medium / low. context_tags: list of context strings for the dashboard (pass [] to clear). evaluated: set true when you have reviewed the completion."""
+    """Update any fields on a task. Valid statuses: todo, in_progress, done, evaluated. threat_level: high / medium / low. context_tags: list of context strings for the dashboard (pass [] to clear)."""
     response_cache.invalidate()
     result = ctx.deps.tasks.update(
         task_id, title, status, description, due_date,
-        deadline_type, deadline_note, defer_until,
-        energy, recurrence, review_interval, notes, size, quest_id, threat_level,
-        context_tags, evaluated,
+        deadline_type, defer_until,
+        energy, recurrence,
+        next_user_review, user_review_notes,
+        next_ai_review, ai_review_notes,
+        notes, size, quest_id, threat_level, context_tags,
     )
     return compact(result) if result else None
 
@@ -266,10 +310,17 @@ async def create_quest(
     description: str | None = None,
     quest_line_id: str | None = None,
     size: int | None = None,
+    next_user_review: date | None = None,
+    user_review_notes: str | None = None,
+    next_ai_review: date | None = None,
+    ai_review_notes: str | None = None,
 ) -> Quest:
     """Create a multi-step outcome. status is required — choose: available, current, tracked, or done. Size uses Fibonacci scale: 1, 2, 3, 5, 8, 13, 21."""
     response_cache.invalidate()
-    return compact(ctx.deps.quests.create(title, description, status, quest_line_id, size))
+    q = ctx.deps.quests.create(title, description, status, quest_line_id, size)
+    if any([next_user_review, user_review_notes, next_ai_review, ai_review_notes]):
+        q = ctx.deps.quests.update(q.id, next_user_review=next_user_review, user_review_notes=user_review_notes, next_ai_review=next_ai_review, ai_review_notes=ai_review_notes)
+    return compact(q)
 
 
 @agent.tool
@@ -291,11 +342,13 @@ async def update_quest(
     description: str | None = None,
     due_date: date | None = None,
     deadline_type: str | None = None,
-    deadline_note: str | None = None,
     defer_until: date | None = None,
     energy: str | None = None,
     recurrence: int | None = None,
-    review_interval: int | None = None,
+    next_user_review: date | None = None,
+    user_review_notes: str | None = None,
+    next_ai_review: date | None = None,
+    ai_review_notes: str | None = None,
     notes: str | None = None,
     quest_line_id: str | None = None,
     size: int | None = None,
@@ -304,8 +357,11 @@ async def update_quest(
     response_cache.invalidate()
     result = ctx.deps.quests.update(
         quest_id, title, status, description, due_date,
-        deadline_type, deadline_note, defer_until,
-        energy, recurrence, review_interval, notes, quest_line_id, size,
+        deadline_type, defer_until,
+        energy, recurrence,
+        next_user_review, user_review_notes,
+        next_ai_review, ai_review_notes,
+        notes, quest_line_id, size,
     )
     return compact(result) if result else None
 
@@ -318,10 +374,17 @@ async def create_quest_line(
     title: str,
     status: str,
     description: str | None = None,
+    next_user_review: date | None = None,
+    user_review_notes: str | None = None,
+    next_ai_review: date | None = None,
+    ai_review_notes: str | None = None,
 ) -> QuestLine:
     """Create a long-running project. status is required — choose: available, current, tracked, or done."""
     response_cache.invalidate()
-    return compact(ctx.deps.quest_lines.create(title, description, status))
+    ql = ctx.deps.quest_lines.create(title, description, status)
+    if any([next_user_review, user_review_notes, next_ai_review, ai_review_notes]):
+        ql = ctx.deps.quest_lines.update(ql.id, next_user_review=next_user_review, user_review_notes=user_review_notes, next_ai_review=next_ai_review, ai_review_notes=ai_review_notes)
+    return compact(ql)
 
 
 @agent.tool
@@ -339,19 +402,24 @@ async def update_quest_line(
     description: str | None = None,
     due_date: date | None = None,
     deadline_type: str | None = None,
-    deadline_note: str | None = None,
     defer_until: date | None = None,
     energy: str | None = None,
     recurrence: int | None = None,
-    review_interval: int | None = None,
+    next_user_review: date | None = None,
+    user_review_notes: str | None = None,
+    next_ai_review: date | None = None,
+    ai_review_notes: str | None = None,
     notes: str | None = None,
 ) -> QuestLine | None:
-    """Update any fields on a quest line. Valid statuses: available, current, tracked, done. Supports review_interval (days between reviews) and defer_until."""
+    """Update any fields on a quest line. Valid statuses: available, current, tracked, done."""
     response_cache.invalidate()
     result = ctx.deps.quest_lines.update(
         quest_line_id, title, status, description, due_date,
-        deadline_type, deadline_note, defer_until,
-        energy, recurrence, review_interval, notes,
+        deadline_type, defer_until,
+        energy, recurrence,
+        next_user_review, user_review_notes,
+        next_ai_review, ai_review_notes,
+        notes,
     )
     return compact(result) if result else None
 
@@ -360,7 +428,7 @@ async def update_quest_line(
 
 @agent.tool
 async def mark_reviewed(ctx: RunContext[AppDeps], item_type: str, item_id: str) -> bool:
-    """Mark an item as reviewed today. item_type must be 'task', 'quest', or 'quest_line'."""
+    """Mark an item as reviewed — sets next_user_review to 7 days from today. item_type must be 'task', 'quest', or 'quest_line'."""
     response_cache.invalidate()
     if item_type == "task":
         return ctx.deps.tasks.mark_reviewed(item_id) is not None
@@ -373,7 +441,7 @@ async def mark_reviewed(ctx: RunContext[AppDeps], item_type: str, item_id: str) 
 
 @agent.tool
 async def flag_for_review(ctx: RunContext[AppDeps], item_type: str, item_id: str) -> bool:
-    """Flag an item to appear at the top of the review queue immediately. Clears last_reviewed and sets review_interval to 1 if unset. item_type must be 'task', 'quest', or 'quest_line'."""
+    """Flag an item to appear at the top of the review queue immediately (sets next_user_review to today). item_type must be 'task', 'quest', or 'quest_line'."""
     response_cache.invalidate()
     if item_type == "task":
         return ctx.deps.tasks.flag_for_review(item_id) is not None
@@ -386,7 +454,7 @@ async def flag_for_review(ctx: RunContext[AppDeps], item_type: str, item_id: str
 
 @agent.tool
 async def next_review_item(ctx: RunContext[AppDeps]) -> dict | None:
-    """Get the single item most overdue for review. Returns None if nothing needs reviewing."""
+    """Get the single item most overdue for user review. Returns None if nothing needs reviewing."""
     return get_next_review_item()
 
 
@@ -498,7 +566,7 @@ _TOOL_LABELS = {
 }
 
 _ID_ARGS = {"task_id", "quest_id", "quest_line_id", "subject_id", "item_id", "item_type"}
-_SKIP_FIELDS = {"id", "created_at", "completed_at", "last_reviewed", "title", "content", "quest_line_id", "quest_id"}
+_SKIP_FIELDS = {"id", "created_at", "completed_at", "title", "content", "quest_line_id", "quest_id"}
 _CREATE_TOOLS = {"create_task", "create_quest", "create_quest_line", "create_subject", "create_inbox_item"}
 
 def extract_tool_events(result) -> list[str]:
@@ -695,6 +763,11 @@ async def initial(request: InitialRequest) -> ChatResponse:
         return ChatResponse(response="", quest_data=data)
 
 
+@app.get("/quests")
+async def quests_data(energy: str | None = None) -> dict:
+    return build_quest_data(deps.quest_lines, deps.quests, deps.tasks, energy)
+
+
 @app.post("/chat")
 async def chat(request: ChatRequest) -> ChatResponse:
     history = build_history(request.history)
@@ -716,7 +789,7 @@ async def dashboard() -> dict:
     all_tasks = deps.tasks.list()
     active = [
         t for t in all_tasks
-        if t.status not in ("done",)
+        if t.status not in ("done", "evaluated")
         and t.context_tags
         and not (t.defer_until and t.defer_until > today)
     ]
@@ -742,6 +815,13 @@ async def complete_task(task_id: str) -> dict:
     result = deps.tasks.update(task_id, status="done")
     response_cache.invalidate()
     return {"ok": True} if result else {"ok": False}
+
+
+@app.post("/jobs/ai-review")
+async def trigger_ai_review() -> dict:
+    """Manually trigger the AI review job."""
+    summary = await run_ai_review(agent, deps)
+    return {"summary": summary}
 
 
 # Serve frontend static files — must be mounted last, after all API routes.
