@@ -290,6 +290,11 @@ function AiChat({ mode, energy, getContext, onRefresh }: AiChatProps) {
           placeholder={hasMessages ? "Reply… (Ctrl+Enter for new thread)" : "Ask AI about this view…"}
           disabled={loading}
         />
+        {hasMessages && (
+          <button onClick={() => setMessages([])} disabled={loading} style={{ padding: "0.45rem 0.6rem", fontSize: "0.85rem", borderRadius: 5, cursor: "pointer", background: "var(--c-bg-muted)", color: "var(--c-text-secondary)", border: "1px solid var(--c-border)" }}>
+            New
+          </button>
+        )}
         <button onClick={() => send(false)} disabled={loading} style={{ padding: "0.45rem 0.75rem", fontSize: "0.85rem", borderRadius: 5, cursor: "pointer" }}>
           {loading ? "…" : "Ask"}
         </button>
@@ -514,47 +519,53 @@ function Dashboard({ energy }: { energy: Energy | null }) {
     return lines.join("\n") + "\n";
   }
 
-  if (loading) return <div style={{ color: "var(--c-text-dim)" }}>Loading…</div>;
-
   return (
     <div>
-      <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: "0.75rem" }}>
-        <button onClick={load} style={{ fontSize: "0.8rem", padding: "0.2rem 0.6rem" }}>Refresh</button>
-      </div>
-      {groups.length === 0 ? (
-        <div style={{ color: "var(--c-text-muted)", fontSize: "0.9rem" }}>
-          <p>No suggested tasks yet.</p>
-          <p style={{ marginTop: "0.5rem" }}>Ask the AI below to tag tasks for the dashboard — for example: "Tag some tasks for the dashboard based on what makes sense to do today."</p>
-        </div>
+      {loading && groups.length === 0 ? (
+        <div style={{ color: "var(--c-text-dim)" }}>Loading…</div>
       ) : (
-        <div style={{ display: "grid", gap: "1rem" }}>
-          {groups.map(g => (
-            <div key={g.tag} style={{ border: "1px solid var(--c-border)", borderRadius: 8, padding: "1rem", background: "var(--c-bg-card)" }}>
-              <div style={{ fontWeight: 700, fontSize: "0.95rem", marginBottom: "0.75rem", color: "var(--c-text-primary)" }}>
-                {g.tag}
-              </div>
-              {g.tasks.map((t, i) => (
-                <div
-                  key={t.id}
-                  style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "0.4rem 0", borderTop: i > 0 ? "1px solid var(--c-border-light)" : undefined }}
-                >
-                  <div style={{ display: "flex", alignItems: "center", flex: 1, minWidth: 0, flexWrap: "wrap" }}>
-                    <span style={{ fontSize: "0.9rem", color: "var(--c-text-primary)" }}>{t.title}</span>
-                    <ThreatChip level={t.threat_level} />
-                    {t.energy && <Battery level={t.energy} />}
-                    {t.due_days != null && <DueChip days={t.due_days} />}
+        <>
+          <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: "0.75rem" }}>
+            <button onClick={load} style={{ fontSize: "0.8rem", padding: "0.2rem 0.6rem" }}>
+              {loading ? "Refreshing…" : "Refresh"}
+            </button>
+          </div>
+          {groups.length === 0 ? (
+            <div style={{ color: "var(--c-text-muted)", fontSize: "0.9rem" }}>
+              <p>No suggested tasks yet.</p>
+              <p style={{ marginTop: "0.5rem" }}>Ask the AI below to tag tasks for the dashboard — for example: "Tag some tasks for the dashboard based on what makes sense to do today."</p>
+            </div>
+          ) : (
+            <div style={{ display: "grid", gap: "1rem" }}>
+              {groups.map(g => (
+                <div key={g.tag} style={{ border: "1px solid var(--c-border)", borderRadius: 8, padding: "1rem", background: "var(--c-bg-card)" }}>
+                  <div style={{ fontWeight: 700, fontSize: "0.95rem", marginBottom: "0.75rem", color: "var(--c-text-primary)" }}>
+                    {g.tag}
                   </div>
-                  <button
-                    onClick={() => complete(t.id)}
-                    style={{ marginLeft: "0.75rem", padding: "0.2rem 0.6rem", fontSize: "0.8rem", background: "#10b981", color: "white", border: "none", borderRadius: 4, cursor: "pointer", flexShrink: 0 }}
-                  >
-                    Done
-                  </button>
+                  {g.tasks.map((t, i) => (
+                    <div
+                      key={t.id}
+                      style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "0.4rem 0", borderTop: i > 0 ? "1px solid var(--c-border-light)" : undefined }}
+                    >
+                      <div style={{ display: "flex", alignItems: "center", flex: 1, minWidth: 0, flexWrap: "wrap" }}>
+                        <span style={{ fontSize: "0.9rem", color: "var(--c-text-primary)" }}>{t.title}</span>
+                        <ThreatChip level={t.threat_level} />
+                        {t.energy && <Battery level={t.energy} />}
+                        {t.due_days != null && <DueChip days={t.due_days} />}
+                      </div>
+                      <button
+                        onClick={() => complete(t.id)}
+                        style={{ marginLeft: "0.75rem", padding: "0.2rem 0.6rem", fontSize: "0.8rem", background: "#10b981", color: "white", border: "none", borderRadius: 4, cursor: "pointer", flexShrink: 0 }}
+                      >
+                        Done
+                      </button>
+                    </div>
+                  ))}
                 </div>
               ))}
             </div>
-          ))}
-        </div>
+          )}
+        </>
       )}
 
       <AiChat mode="dashboard" energy={energy} getContext={getContext} onRefresh={load} />
@@ -613,7 +624,7 @@ function Quests({ energy }: { energy: Energy | null }) {
 // ---- App shell -------------------------------------------------------------
 
 export default function App() {
-  const [mode, setMode] = useState<Mode>("processing");
+  const [mode, setMode] = useState<Mode>("dashboard");
   const [energy, setEnergy] = useState<Energy | null>(null);
 
   function toggleEnergy(e: Energy) {
