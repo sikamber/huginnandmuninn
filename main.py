@@ -1,5 +1,5 @@
 from contextlib import asynccontextmanager
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 import json
 import logging
 import os
@@ -25,7 +25,7 @@ from database import create_tables
 from deps import AppDeps
 from inbox import InboxStore
 from quests import Quest, QuestLine, QuestLineStore, QuestStore
-from review import build_review_summary, get_next_review_item
+from review import build_review_summary, count_review_items, get_next_review_item
 from subjects import Subject, SubjectStore
 from tasks import Task, TaskStore
 
@@ -146,27 +146,6 @@ These fields apply to tasks, quests, AND quest lines unless noted:
 ## Dashboard
 When the user asks you to suggest tasks for the dashboard, set `context_tags` on relevant tasks.
 
-## Processing flow
-Use this exact sequence when working through the queue. Do not skip steps or reorder them.
-
-**Step 1 — Fetch.** Call `get_next_item`. It returns an object with a `kind` field, or null.
-- If null: tell the user everything is clear. Stop.
-- If `kind` is `"inbox"`: follow the Inbox path.
-- If `kind` is `"review"`: follow the Review path.
-
-**Inbox path:**
-- Present the item content to the user. Wait for their response.
-- Execute any actions they request (create task, quest, note, etc.).
-- Call `update_inbox_item` with status `"processed"` or `"discarded"`. Never skip this.
-- Return to Step 1.
-
-**Review path:**
-- Present the item using only the data in the tool response: title, description, notes, status, days overdue, and any embedded tasks or quests. Never invent or infer details not in the response. Never call additional tools to look things up. Write a short narrative — no lists of options.
-- Wait for the user to respond.
-- Execute any updates they request.
-- Call `mark_reviewed` for this item. Never skip this.
-- Return to Step 1.
-
 ## General behaviour
 - Summarise meaningfully — don't just read lists back.
 - Do not use emojis or emoticons.
@@ -174,6 +153,7 @@ Use this exact sequence when working through the queue. Do not skip steps or reo
 - When creating a quest or quest line, `status` is required — choose tracked/current/available based on what the user said and confirm before creating.
 - When creating a standalone quest (no quest line), suggest a review interval before creating.
 - When the user says goodbye, create or update subjects to capture anything worth remembering. Ask if unsure.
+- When helping with a specific review item, the user controls advancing to the next item via the interface — do not call get_next_item or mark_reviewed yourself. Just help with what was asked and stop.
 
 ## Radar rules
 - Flag any quest line with no quests at status 'current' or 'tracked' — it may be stalled.
@@ -429,13 +409,7 @@ async def get_next_inbox_item(ctx: RunContext[AppDeps], max_energy: str | None =
 @agent.tool
 async def get_next_item(ctx: RunContext[AppDeps]) -> dict | None:
     """Get the next item that needs attention: inbox items first, then the most overdue review item. Returns the item with a 'kind' field ('inbox' or 'review'), or None if nothing needs attention."""
-    inbox = ctx.deps.inbox.get_next()
-    if inbox:
-        return {"kind": "inbox", **compact(inbox)}
-    review = get_next_review_item()
-    if review:
-        return {"kind": "review", **review}
-    return None
+    return _next_item()
 
 
 @agent.tool
@@ -633,6 +607,68 @@ def build_history(history: list[HistoryMessage]):
         else:
             result.append(ModelResponse(parts=[TextPart(content=msg.content)]))
     return result
+
+
+def _next_item() -> dict | None:
+    inbox = deps.inbox.get_next()
+    if inbox:
+        return {"kind": "inbox", **compact(inbox)}
+    review = get_next_review_item()
+    if review:
+        return {"kind": "review", **review}
+    return None
+
+
+@app.get("/review/next")
+async def review_next() -> dict:
+    return {
+        "item": _next_item(),
+        "inbox_count": len(deps.inbox.list_unprocessed()),
+        "review_count": count_review_items(),
+    }
+
+
+class AdvanceRequest(BaseModel):
+    kind: str
+    item_id: str
+    item_type: str | None = None
+    action: str  # "mark" | "done" | "defer" | "processed" | "discard"
+
+
+@app.post("/review/advance")
+async def review_advance(request: AdvanceRequest) -> dict:
+    response_cache.invalidate()
+    defer_to = date.today() + timedelta(days=7)
+
+    if request.kind == "inbox":
+        status = "discarded" if request.action == "discard" else "processed"
+        deps.inbox.update(request.item_id, status=status)
+    elif request.action == "done" and request.item_type == "task":
+        deps.tasks.update(request.item_id, status="done")
+        deps.tasks.mark_reviewed(request.item_id)
+    elif request.action == "defer":
+        if request.item_type == "task":
+            deps.tasks.update(request.item_id, defer_until=defer_to)
+            deps.tasks.mark_reviewed(request.item_id)
+        elif request.item_type == "quest":
+            deps.quests.update(request.item_id, defer_until=defer_to)
+            deps.quests.mark_reviewed(request.item_id)
+        elif request.item_type == "quest_line":
+            deps.quest_lines.update(request.item_id, defer_until=defer_to)
+            deps.quest_lines.mark_reviewed(request.item_id)
+    else:  # "mark"
+        if request.item_type == "task":
+            deps.tasks.mark_reviewed(request.item_id)
+        elif request.item_type == "quest":
+            deps.quests.mark_reviewed(request.item_id)
+        elif request.item_type == "quest_line":
+            deps.quest_lines.mark_reviewed(request.item_id)
+
+    return {
+        "item": _next_item(),
+        "inbox_count": len(deps.inbox.list_unprocessed()),
+        "review_count": count_review_items(),
+    }
 
 
 @app.post("/inbox")

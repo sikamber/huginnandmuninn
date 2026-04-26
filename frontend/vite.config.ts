@@ -11,6 +11,7 @@ export default defineConfig({
       "/initial": "http://localhost:8000",
       "/dashboard": "http://localhost:8000",
       "/tasks": "http://localhost:8000",
+      "/review": "http://localhost:8000",
     },
   },
 })

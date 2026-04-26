@@ -40,6 +40,37 @@ interface DashboardGroup {
   tasks: TaskData[];
 }
 
+interface ReviewSubItem {
+  id: string;
+  title: string;
+  status: string;
+  description?: string;
+}
+
+interface ReviewItem {
+  kind: "inbox" | "review";
+  id: string;
+  // inbox
+  content?: string;
+  energy?: string;
+  // review
+  type?: "task" | "quest" | "quest_line";
+  title?: string;
+  description?: string;
+  notes?: string;
+  status?: string;
+  days_overdue?: number;
+  last_reviewed?: string;
+  tasks?: ReviewSubItem[];
+  quests?: ReviewSubItem[];
+}
+
+interface ReviewState {
+  item: ReviewItem | null;
+  inbox_count: number;
+  review_count: number;
+}
+
 interface Message {
   role: "user" | "assistant" | "tool";
   content: string;
@@ -171,6 +202,191 @@ function QuestOverview({ data }: { data: QuestOverviewData }) {
       )}
 
       <div style={{ color: "#9ca3af", fontSize: "0.8rem", marginTop: "0.75rem" }}>Reply to get suggestions, or ask anything.</div>
+    </div>
+  );
+}
+
+const TYPE_LABEL: Record<string, string> = {
+  task: "Task",
+  quest: "Quest",
+  quest_line: "Quest Line",
+  inbox: "Inbox",
+};
+
+function Processing({ energy: _energy }: { energy: Energy | null }) {
+  const [state, setState] = useState<ReviewState | null>(null);
+  const [acting, setActing] = useState(false);
+  const [aiMessages, setAiMessages] = useState<{ role: "user" | "assistant"; content: string }[]>([]);
+  const [aiInput, setAiInput] = useState("");
+  const [aiLoading, setAiLoading] = useState(false);
+
+  async function load() {
+    const data = await fetch("/review/next").then(r => r.json());
+    setState(data);
+    setAiMessages([]);
+  }
+
+  useEffect(() => { load(); }, []);
+
+  async function advance(action: string) {
+    if (!state?.item || acting) return;
+    setActing(true);
+    const { kind, id, type } = state.item;
+    const data = await fetch("/review/advance", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ kind, item_id: id, item_type: type ?? null, action }),
+    }).then(r => r.json());
+    setState(data);
+    setAiMessages([]);
+    setActing(false);
+  }
+
+  async function askAI() {
+    const text = aiInput.trim();
+    if (!text || aiLoading || !state?.item) return;
+    setAiInput("");
+    setAiLoading(true);
+
+    const item = state.item;
+    const context = item.kind === "inbox"
+      ? `[Processing inbox item: "${item.content}"]\n`
+      : `[Processing ${TYPE_LABEL[item.type ?? ""] ?? item.type}: "${item.title}" — ${item.days_overdue}d overdue. Status: ${item.status}. Description: ${item.description ?? "none"}. Notes: ${item.notes ?? "none"}.]\n`;
+
+    setAiMessages(prev => [...prev, { role: "user", content: text }]);
+
+    const { response } = await fetch("/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message: context + text, history: [], mode: "processing" }),
+    }).then(r => r.json());
+
+    setAiMessages(prev => [...prev, { role: "assistant", content: response }]);
+    setAiLoading(false);
+    // refresh item in case AI updated any fields
+    const fresh = await fetch("/review/next").then(r => r.json());
+    setState(s => s ? { ...fresh } : s);
+  }
+
+  if (!state) return <div style={{ color: "#999" }}>Loading...</div>;
+
+  const { item, inbox_count, review_count } = state;
+
+  return (
+    <div>
+      {/* Info box */}
+      <div style={{ display: "flex", gap: "1rem", marginBottom: "1rem", padding: "0.6rem 0.9rem", background: "#f8fafc", border: "1px solid #e5e7eb", borderRadius: 8, fontSize: "0.85rem", color: "#6b7280" }}>
+        <span><strong style={{ color: inbox_count > 0 ? "#374151" : undefined }}>{inbox_count}</strong> inbox</span>
+        <span><strong style={{ color: review_count > 0 ? "#374151" : undefined }}>{review_count}</strong> review</span>
+        <button onClick={load} style={{ marginLeft: "auto", fontSize: "0.8rem", padding: "0.1rem 0.5rem", cursor: "pointer" }}>↺ Refresh</button>
+      </div>
+
+      {/* Item card */}
+      {!item ? (
+        <div style={{ color: "#6b7280", fontSize: "0.9rem", padding: "1.5rem 0" }}>All caught up — nothing needs attention.</div>
+      ) : (
+        <div style={{ border: "1px solid #e5e7eb", borderRadius: 8, padding: "1rem", marginBottom: "1rem" }}>
+          {/* Header row */}
+          <div style={{ display: "flex", gap: "0.5rem", alignItems: "center", marginBottom: "0.75rem" }}>
+            <span style={{ fontSize: "0.7rem", fontWeight: 700, padding: "0.15rem 0.5rem", borderRadius: 4, background: "#e0f2fe", color: "#0369a1", textTransform: "uppercase", letterSpacing: "0.05em" }}>
+              {item.kind === "inbox" ? "Inbox" : TYPE_LABEL[item.type ?? ""] ?? item.type}
+            </span>
+            {item.kind === "review" && item.days_overdue !== undefined && (
+              <span style={{ fontSize: "0.75rem", color: item.days_overdue > 14 ? "#991b1b" : "#92400e" }}>
+                {item.days_overdue}d overdue
+              </span>
+            )}
+          </div>
+
+          {/* Title / content */}
+          <div style={{ fontWeight: 700, fontSize: "1rem", marginBottom: "0.5rem" }}>
+            {item.kind === "inbox" ? item.content : item.title}
+          </div>
+
+          {/* Detail fields */}
+          {item.description && (
+            <div style={{ fontSize: "0.875rem", color: "#374151", marginBottom: "0.4rem" }}>{item.description}</div>
+          )}
+          {item.notes && (
+            <div style={{ fontSize: "0.85rem", color: "#6b7280", fontStyle: "italic", marginBottom: "0.4rem" }}>Notes: {item.notes}</div>
+          )}
+          {item.last_reviewed && (
+            <div style={{ fontSize: "0.75rem", color: "#9ca3af", marginBottom: "0.5rem" }}>Last reviewed: {item.last_reviewed}</div>
+          )}
+
+          {/* Subtasks */}
+          {item.tasks && item.tasks.length > 0 && (
+            <div style={{ marginBottom: "0.5rem" }}>
+              <div style={{ fontSize: "0.75rem", fontWeight: 600, color: "#6b7280", marginBottom: "0.25rem" }}>TASKS</div>
+              {item.tasks.map(t => (
+                <div key={t.id} style={{ fontSize: "0.85rem", color: "#374151", paddingLeft: "0.5rem", marginBottom: "0.15rem" }}>
+                  • {t.title} <span style={{ color: "#9ca3af" }}>({t.status})</span>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* Sub-quests */}
+          {item.quests && item.quests.length > 0 && (
+            <div style={{ marginBottom: "0.5rem" }}>
+              <div style={{ fontSize: "0.75rem", fontWeight: 600, color: "#6b7280", marginBottom: "0.25rem" }}>QUESTS</div>
+              {item.quests.map(q => (
+                <div key={q.id} style={{ fontSize: "0.85rem", color: "#374151", paddingLeft: "0.5rem", marginBottom: "0.15rem" }}>
+                  • {q.title} <span style={{ color: "#9ca3af" }}>({q.status})</span>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* Action buttons */}
+          <div style={{ display: "flex", gap: "0.5rem", marginTop: "0.75rem", flexWrap: "wrap" }}>
+            {item.kind === "inbox" ? (
+              <>
+                <button onClick={() => advance("processed")} disabled={acting} style={{ padding: "0.3rem 0.75rem", background: "#0070f3", color: "white", border: "none", borderRadius: 5, cursor: "pointer", fontSize: "0.85rem" }}>Processed</button>
+                <button onClick={() => advance("discard")} disabled={acting} style={{ padding: "0.3rem 0.75rem", background: "#f3f4f6", color: "#374151", border: "1px solid #d1d5db", borderRadius: 5, cursor: "pointer", fontSize: "0.85rem" }}>Discard</button>
+              </>
+            ) : (
+              <>
+                <button onClick={() => advance("mark")} disabled={acting} style={{ padding: "0.3rem 0.75rem", background: "#0070f3", color: "white", border: "none", borderRadius: 5, cursor: "pointer", fontSize: "0.85rem" }}>Mark reviewed</button>
+                <button onClick={() => advance("defer")} disabled={acting} style={{ padding: "0.3rem 0.75rem", background: "#f3f4f6", color: "#374151", border: "1px solid #d1d5db", borderRadius: 5, cursor: "pointer", fontSize: "0.85rem" }}>Defer 7d</button>
+                {item.type === "task" && (
+                  <button onClick={() => advance("done")} disabled={acting} style={{ padding: "0.3rem 0.75rem", background: "#10b981", color: "white", border: "none", borderRadius: 5, cursor: "pointer", fontSize: "0.85rem" }}>Mark done</button>
+                )}
+              </>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* AI chat */}
+      {item && (
+        <div style={{ marginTop: "0.5rem" }}>
+          {aiMessages.length > 0 && (
+            <div style={{ marginBottom: "0.75rem" }}>
+              {aiMessages.map((m, i) => (
+                <div key={i} style={{ marginBottom: "0.5rem", textAlign: m.role === "user" ? "right" : "left" }}>
+                  <span style={{ display: "inline-block", padding: "0.4rem 0.7rem", borderRadius: 8, background: m.role === "user" ? "#0070f3" : "#f0f0f0", color: m.role === "user" ? "white" : "black", maxWidth: "85%", fontSize: "0.9rem", textAlign: "left" }}>
+                    {m.role === "user" ? m.content : <Markdown remarkPlugins={[remarkGfm]}>{m.content}</Markdown>}
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+          <div style={{ display: "flex", gap: "0.5rem" }}>
+            <input
+              style={{ flex: 1, padding: "0.5rem", fontSize: "0.9rem" }}
+              value={aiInput}
+              onChange={e => setAiInput(e.target.value)}
+              onKeyDown={e => { if (e.key === "Enter" && !e.ctrlKey) askAI(); }}
+              placeholder="Ask AI about this item…"
+              disabled={aiLoading}
+            />
+            <button onClick={askAI} disabled={aiLoading} style={{ padding: "0.5rem 0.75rem", fontSize: "0.9rem" }}>
+              {aiLoading ? "…" : "Ask"}
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -499,14 +715,15 @@ export default function App() {
       <div style={{ display: mode === "inbox" ? "block" : "none" }}>
         <InboxDrop />
       </div>
+      <div style={{ display: mode === "processing" ? "block" : "none" }}>
+        <Processing energy={energy} />
+      </div>
       <div style={{ display: mode === "dashboard" ? "block" : "none" }}>
         <Dashboard />
       </div>
-      {(["processing", "quests"] as Mode[]).map((m) => (
-        <div key={m} style={{ display: mode === m ? "block" : "none" }}>
-          <Chat mode={m} energy={energy} autoPrompt={AUTO_PROMPTS[m]} />
-        </div>
-      ))}
+      <div style={{ display: mode === "quests" ? "block" : "none" }}>
+        <Chat mode="quests" energy={energy} autoPrompt={AUTO_PROMPTS["quests"]} />
+      </div>
     </div>
   );
 }
