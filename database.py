@@ -21,6 +21,7 @@ _MIGRATIONS = [
     ("questline", "user_review_notes", "TEXT"),
     ("questline", "next_ai_review", "DATE"),
     ("questline", "ai_review_notes", "TEXT"),
+    ("inboxitem", "threat_level", "VARCHAR NOT NULL DEFAULT 'medium'"),
 ]
 
 

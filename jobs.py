@@ -29,27 +29,27 @@ async def run_ai_review(agent, deps) -> str:
 
     prompt = f"""You are running the scheduled AI review job for {today}.
 
-Review the following items and take appropriate actions using the available tools:
+Review the following items and write a structured markdown report. Do NOT call any tools — your text output will be saved to the inbox as a report automatically.
 
 {chr(10).join(parts)}
 
-For completed tasks (status='done'):
-- Call update_task to set status='evaluated' if the task appears properly complete with no concerns.
-- If there are concerns or follow-up tasks needed, note them in ai_review_notes before evaluating.
-- Create follow-up tasks via create_task if warranted.
+Write a report with these sections:
 
-For scheduled AI review items (next_ai_review has passed):
-- Review the item's purpose and ai_review_notes.
-- Update ai_review_notes with your current assessment via update_task/update_quest/update_quest_line.
-- Set a new next_ai_review date if continued monitoring is needed.
-- Flag any concerns that require user attention.
+## Completed Tasks
+For each task marked as done, give a one-line assessment: does it look properly complete? Note any concerns or follow-up needed.
 
-After processing all items, write a concise summary (2-5 sentences) of what you did and any issues that need the user's attention. This summary will be added to the inbox."""
+## Scheduled Reviews
+For each item with a scheduled AI review, assess it against its ai_review_notes and give a one-line status update.
+
+## Suggested Actions
+List specific actions you recommend the user take. Be concrete — name the item and what to do (e.g. "Mark [task title] as evaluated", "Set next_ai_review for [quest] to YYYY-MM-DD", "Create a follow-up task for [item]"). The user will approve and implement these via the chat.
+
+Keep the report concise. Do not implement any changes — only analyse and suggest."""
 
     result = await agent.run(prompt, deps=deps)
     summary = result.output
 
-    report = f"AI Review — {today}\n\n{summary}"
+    report = f"# AI Review — {today}\n\n{summary}"
     deps.inbox.create(report)
 
     return summary

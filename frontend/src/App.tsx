@@ -52,6 +52,7 @@ interface ReviewItem {
   id: string;
   content?: string;
   energy?: string;
+  threat_level?: string;
   type?: "task" | "quest" | "quest_line";
   title?: string;
   description?: string;
@@ -73,6 +74,7 @@ interface ReviewState {
 interface AiMessage {
   role: "user" | "assistant" | "tool";
   content: string;
+  historyContent?: string;
 }
 
 const MODES: { id: Mode; label: string }[] = [
@@ -226,7 +228,21 @@ function AiChat({ mode, energy, getContext, onRefresh }: AiChatProps) {
 
     const history = fresh
       ? []
-      : messages.filter(m => m.role !== "tool").map(m => ({ role: m.role, content: m.content }));
+      : messages.reduce<{ role: string; content: string }[]>((acc, m, i, arr) => {
+          if (m.role === "tool") return acc;
+          if (m.role === "assistant") {
+            // Merge any preceding tool events into the assistant message for context
+            const toolsBefore: string[] = [];
+            for (let j = i - 1; j >= 0 && arr[j].role === "tool"; j--) {
+              toolsBefore.unshift(arr[j].content);
+            }
+            const content = toolsBefore.length > 0
+              ? `[Tool calls: ${toolsBefore.join("; ")}]\n\n${m.content}`
+              : m.content;
+            return [...acc, { role: m.role, content }];
+          }
+          return [...acc, { role: m.role, content: m.content }];
+        }, []);
 
     if (fresh) setMessages([]);
 
@@ -364,10 +380,11 @@ function Processing({ energy }: { energy: Energy | null }) {
       ) : (
         <div style={{ border: "1px solid var(--c-border)", borderRadius: 8, padding: "1rem", marginBottom: "0.25rem", background: "var(--c-bg-card)" }}>
           {/* header */}
-          <div style={{ display: "flex", gap: "0.5rem", alignItems: "center", marginBottom: "0.75rem" }}>
+          <div style={{ display: "flex", gap: "0.5rem", alignItems: "center", marginBottom: "0.75rem", flexWrap: "wrap" }}>
             <span style={{ fontSize: "0.7rem", fontWeight: 700, padding: "0.15rem 0.5rem", borderRadius: 4, background: "var(--c-badge-bg)", color: "var(--c-badge-color)", textTransform: "uppercase", letterSpacing: "0.05em" }}>
               {item.kind === "inbox" ? "Inbox" : TYPE_LABEL[item.type ?? ""] ?? item.type}
             </span>
+            {item.threat_level && <ThreatChip level={item.threat_level} />}
             {item.kind === "review" && item.days_overdue !== undefined && (
               <span style={{ fontSize: "0.75rem", color: item.days_overdue > 14 ? "var(--c-chip-danger-text)" : "var(--c-chip-warn-text)" }}>
                 {item.days_overdue}d overdue
@@ -375,10 +392,16 @@ function Processing({ energy }: { energy: Energy | null }) {
             )}
           </div>
 
-          {/* title */}
-          <div style={{ fontWeight: 700, fontSize: "1rem", marginBottom: "0.5rem", color: "var(--c-text-primary)" }}>
-            {item.kind === "inbox" ? item.content : item.title}
-          </div>
+          {/* title / content */}
+          {item.kind === "inbox" ? (
+            <div style={{ fontSize: "0.9rem", color: "var(--c-text-primary)", marginBottom: "0.5rem" }}>
+              <Markdown remarkPlugins={[remarkGfm]}>{item.content ?? ""}</Markdown>
+            </div>
+          ) : (
+            <div style={{ fontWeight: 700, fontSize: "1rem", marginBottom: "0.5rem", color: "var(--c-text-primary)" }}>
+              {item.title}
+            </div>
+          )}
 
           {item.description && (
             <div style={{ fontSize: "0.875rem", color: "var(--c-text-secondary)", marginBottom: "0.4rem" }}>{item.description}</div>
@@ -423,6 +446,9 @@ function Processing({ energy }: { energy: Energy | null }) {
               <>
                 <button onClick={() => advance("processed")} disabled={acting} style={{ padding: "0.3rem 0.75rem", background: "#0070f3", color: "white", border: "none", borderRadius: 5, cursor: "pointer", fontSize: "0.85rem" }}>Mark processed</button>
                 <button onClick={() => advance("discard")} disabled={acting} style={{ padding: "0.3rem 0.75rem", background: "var(--c-bg-muted)", color: "var(--c-text-secondary)", border: "1px solid var(--c-border)", borderRadius: 5, cursor: "pointer", fontSize: "0.85rem" }}>Discard</button>
+                {item.threat_level !== "low" && (
+                  <button onClick={() => advance("defer_threat")} disabled={acting} style={{ padding: "0.3rem 0.75rem", background: "var(--c-bg-muted)", color: "var(--c-text-secondary)", border: "1px solid var(--c-border)", borderRadius: 5, cursor: "pointer", fontSize: "0.85rem" }}>Defer to low</button>
+                )}
               </>
             ) : (
               <>

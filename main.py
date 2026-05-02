@@ -13,7 +13,7 @@ from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from pydantic_ai import Agent, RunContext
-from pydantic_ai.messages import ModelMessagesTypeAdapter, ModelRequest, ModelResponse, TextPart, UserPromptPart
+from pydantic_ai.messages import ModelMessagesTypeAdapter, ModelRequest, ModelResponse, TextPart, ToolCallPart, ToolReturnPart, UserPromptPart
 from pydantic_ai.models.anthropic import AnthropicModelSettings
 
 CACHE_SETTINGS = AnthropicModelSettings(
@@ -151,7 +151,7 @@ These fields apply to tasks, quests, AND quest lines unless noted:
 - `deadline_type`: hard (must happen by due_date) or soft (would like to by due_date)
 - `defer_until`: hide from radar until this date
 - `energy`: low / medium / high — context needed to engage with this item
-- `threat_level` (tasks only): high / medium (default) / low — urgency/importance
+- `threat_level` (tasks and inbox items): high / medium (default) / low — urgency/importance. Inbox items starting with "!" are automatically created at high threat.
 - `recurrence`: days between expected recurrences
 - `next_user_review`: date the item should next surface for user review
 - `user_review_notes`: note shown to the user when this item surfaces for review
@@ -172,6 +172,7 @@ When the user asks you to suggest tasks for the dashboard, set `context_tags` on
 - When the user says goodbye, create or update subjects to capture anything worth remembering. Ask if unsure.
 - When helping with a specific review item, the user controls advancing to the next item via the interface — do not call mark_reviewed yourself. Just help with what was asked and stop.
 - When setting next_ai_review, write a clear ai_review_notes explaining what to check for at that date.
+- After calling tools, do not describe what the tools did in your response — the interface shows tool events separately. Focus your response on analysis, next steps, or answering the user's question.
 
 ## Radar rules
 - Flag any quest line with no quests at status 'current' or 'tracked' — it may be stalled.
@@ -487,7 +488,7 @@ async def get_next_item(ctx: RunContext[AppDeps]) -> dict | None:
 @agent.tool
 async def list_inbox_items(ctx: RunContext[AppDeps]) -> list[dict]:
     """List all unprocessed inbox items. Use when the user wants an overview; use get_next_inbox_item to process them one at a time."""
-    return [{"id": i.id, "content": i.content, "energy": i.energy, "created_at": str(i.created_at.date())} for i in ctx.deps.inbox.list_unprocessed()]
+    return [{"id": i.id, "content": i.content, "energy": i.energy, "threat_level": i.threat_level, "created_at": str(i.created_at.date())} for i in ctx.deps.inbox.list_unprocessed()]
 
 
 @agent.tool
@@ -496,10 +497,11 @@ async def update_inbox_item(
     item_id: str,
     status: str | None = None,
     energy: str | None = None,
+    threat_level: str | None = None,
 ) -> dict | None:
-    """Update an inbox item. Valid status values: 'processed' (handled), 'discarded' (dismissed), 'unprocessed' (default). Do NOT use 'closed', 'done', or any other value."""
+    """Update an inbox item. Valid status values: 'processed' (handled), 'discarded' (dismissed), 'unprocessed' (default). threat_level: 'high', 'medium', 'low'. Do NOT use 'closed', 'done', or any other status value."""
     response_cache.invalidate()
-    result = ctx.deps.inbox.update(item_id, status, energy)
+    result = ctx.deps.inbox.update(item_id, status, energy, threat_level)
     return compact(result) if result else None
 
 
@@ -577,17 +579,29 @@ def extract_tool_events(result) -> list[str]:
     returns: dict[str, any] = {}
     for msg in result.all_messages():
         for part in getattr(msg, "parts", []):
-            if hasattr(part, "tool_call_id") and hasattr(part, "content") and not hasattr(part, "args"):
-                try:
-                    returns[part.tool_call_id] = json.loads(part.content)
-                except Exception:
-                    returns[part.tool_call_id] = None
+            if not isinstance(part, ToolReturnPart):
+                continue
+            tid = getattr(part, "tool_call_id", None)
+            if tid is None:
+                continue
+            try:
+                content = part.content
+                if isinstance(content, str):
+                    returns[tid] = json.loads(content)
+                elif isinstance(content, dict):
+                    returns[tid] = content
+                else:
+                    returns[tid] = None
+            except Exception:
+                returns[tid] = None
 
     events = []
     for msg in result.all_messages():
         for part in getattr(msg, "parts", []):
+            if not isinstance(part, ToolCallPart):
+                continue
             name = getattr(part, "tool_name", None)
-            if name not in _TOOL_LABELS or not hasattr(part, "args"):
+            if name not in _TOOL_LABELS:
                 continue
             label = _TOOL_LABELS[name]
             try:
@@ -595,10 +609,17 @@ def extract_tool_events(result) -> list[str]:
                     args = part.args_as_dict()
                 else:
                     raw = getattr(part, "args", {})
-                    args = json.loads(raw) if isinstance(raw, str) else (raw if isinstance(raw, dict) else {})
+                    if isinstance(raw, str):
+                        args = json.loads(raw) if raw else {}
+                    elif isinstance(raw, dict):
+                        args = raw
+                    else:
+                        args = {}
             except Exception:
                 args = {}
-            ret = returns.get(getattr(part, "tool_call_id", None))
+
+            tid = getattr(part, "tool_call_id", None)
+            ret = returns.get(tid) if tid is not None else None
 
             item_name = None
             if isinstance(ret, dict):
@@ -713,8 +734,11 @@ async def review_advance(request: AdvanceRequest) -> dict:
     defer_to = date.today() + timedelta(days=7)
 
     if request.kind == "inbox":
-        status = "discarded" if request.action == "discard" else "processed"
-        deps.inbox.update(request.item_id, status=status)
+        if request.action == "defer_threat":
+            deps.inbox.update(request.item_id, threat_level="low")
+        else:
+            status = "discarded" if request.action == "discard" else "processed"
+            deps.inbox.update(request.item_id, status=status)
     elif request.action == "done" and request.item_type == "task":
         deps.tasks.update(request.item_id, status="done")
         deps.tasks.mark_reviewed(request.item_id)
@@ -778,10 +802,9 @@ async def chat(request: ChatRequest) -> ChatResponse:
     message = request.message
     if request.energy_level:
         message = f"[My current energy level: {request.energy_level}]\n{message}"
-    model_override = "anthropic:claude-haiku-4-5-20251001" if request.mode == "processing" else None
     result = await agent.run(
         message, deps=deps, message_history=history,
-        model_settings=CACHE_SETTINGS, model=model_override,
+        model_settings=CACHE_SETTINGS,
     )
     log_run("chat", result)
     return ChatResponse(response=result.output, tool_events=extract_tool_events(result))
